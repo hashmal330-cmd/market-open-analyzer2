@@ -1824,16 +1824,452 @@ st.markdown(
 )
 
 
+
+# ============================================================
+# Paper Trading - automatic simulation only
+# ============================================================
+
+PAPER_TRADES_FILE = DATA_DIR / "paper_trades.csv"
+
+PAPER_COLUMNS = [
+    "trade_id",
+    "opened_at",
+    "closed_at",
+    "status",
+    "ticker",
+    "horizon",
+    "side",
+    "entry_price",
+    "stop_price",
+    "target_1",
+    "target_2",
+    "current_price",
+    "quantity",
+    "notional",
+    "risk_dollars",
+    "pnl",
+    "pnl_pct",
+    "exit_reason",
+    "signal_score",
+    "signal_quality",
+    "reason",
+]
+
+
+def _extract_last_number(text_value) -> float:
+    """
+    Extract the last number from a Hebrew/English text field.
+    Example: 'בערך 123.45' -> 123.45
+    """
+    import re
+
+    if text_value is None:
+        return np.nan
+
+    matches = re.findall(r"[-+]?\d+(?:\.\d+)?", str(text_value))
+    if not matches:
+        return np.nan
+
+    try:
+        return float(matches[-1])
+    except Exception:
+        return np.nan
+
+
+def load_paper_trades() -> pd.DataFrame:
+    """
+    Load paper trades from local CSV.
+    """
+    if not PAPER_TRADES_FILE.exists():
+        return pd.DataFrame(columns=PAPER_COLUMNS)
+
+    df = pd.read_csv(PAPER_TRADES_FILE)
+
+    for col in PAPER_COLUMNS:
+        if col not in df.columns:
+            df[col] = np.nan
+
+    return df[PAPER_COLUMNS]
+
+
+def save_paper_trades(df: pd.DataFrame) -> None:
+    """
+    Save paper trades to local CSV.
+    """
+    if df is None or df.empty:
+        pd.DataFrame(columns=PAPER_COLUMNS).to_csv(PAPER_TRADES_FILE, index=False)
+        return
+
+    for col in PAPER_COLUMNS:
+        if col not in df.columns:
+            df[col] = np.nan
+
+    df[PAPER_COLUMNS].to_csv(PAPER_TRADES_FILE, index=False)
+
+
+def clear_paper_trades() -> None:
+    """
+    Clear all paper trading history.
+    """
+    pd.DataFrame(columns=PAPER_COLUMNS).to_csv(PAPER_TRADES_FILE, index=False)
+
+
+def get_open_trade_mask(trades: pd.DataFrame, ticker: str, horizon: str) -> pd.Series:
+    if trades.empty:
+        return pd.Series(dtype=bool)
+    return (
+        trades["status"].eq("OPEN")
+        & trades["ticker"].astype(str).eq(str(ticker))
+        & trades["horizon"].astype(str).eq(str(horizon))
+    )
+
+
+def create_paper_trade_from_plan(
+    ticker: str,
+    horizon: str,
+    plan: dict,
+    risk_dollars: float = 25.0,
+    max_notional: float = 1000.0,
+) -> dict | None:
+    """
+    Create a paper trade from an educational plan.
+    This does not execute any real order.
+    """
+
+    bias = str(plan.get("bias", ""))
+
+    if bias in ["LONG_WATCH", "MICRO_LONG"]:
+        side = "LONG"
+    elif bias in ["SHORT_WATCH", "MICRO_SHORT"]:
+        side = "SHORT"
+    else:
+        return None
+
+    entry_price = _safe_float(plan.get("current_price", np.nan))
+    stop_price = _extract_last_number(plan.get("stop", ""))
+    target_1 = _extract_last_number(plan.get("target_1", ""))
+    target_2 = _extract_last_number(plan.get("target_2", ""))
+
+    if not np.isfinite(entry_price) or entry_price <= 0:
+        return None
+    if not np.isfinite(stop_price) or stop_price <= 0:
+        return None
+    if not np.isfinite(target_1) or target_1 <= 0:
+        return None
+
+    if side == "LONG":
+        if stop_price >= entry_price or target_1 <= entry_price:
+            return None
+    else:
+        if stop_price <= entry_price or target_1 >= entry_price:
+            return None
+
+    risk_per_share = abs(entry_price - stop_price)
+    if risk_per_share <= 0:
+        return None
+
+    quantity = float(risk_dollars) / risk_per_share
+
+    if max_notional and max_notional > 0:
+        quantity = min(quantity, float(max_notional) / entry_price)
+
+    quantity = max(quantity, 0)
+
+    if quantity <= 0:
+        return None
+
+    now_ts = pd.Timestamp.now(tz="America/New_York").isoformat()
+
+    return {
+        "trade_id": f"{ticker}_{horizon}_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S_%f')}",
+        "opened_at": now_ts,
+        "closed_at": "",
+        "status": "OPEN",
+        "ticker": ticker,
+        "horizon": horizon,
+        "side": side,
+        "entry_price": float(entry_price),
+        "stop_price": float(stop_price),
+        "target_1": float(target_1),
+        "target_2": float(target_2) if np.isfinite(target_2) else np.nan,
+        "current_price": float(entry_price),
+        "quantity": float(quantity),
+        "notional": float(quantity * entry_price),
+        "risk_dollars": float(risk_dollars),
+        "pnl": 0.0,
+        "pnl_pct": 0.0,
+        "exit_reason": "",
+        "signal_score": int(plan.get("setup_score", 0) or 0),
+        "signal_quality": str(plan.get("setup_quality", "")),
+        "reason": str(plan.get("reason", ""))[:350],
+    }
+
+
+def _calculate_trade_pnl(row, current_price: float) -> tuple[float, float]:
+    entry = float(row["entry_price"])
+    qty = float(row["quantity"])
+    if entry <= 0 or qty <= 0:
+        return 0.0, 0.0
+
+    if str(row["side"]) == "LONG":
+        pnl = (current_price - entry) * qty
+    else:
+        pnl = (entry - current_price) * qty
+
+    notional = entry * qty
+    pnl_pct = (pnl / notional) * 100 if notional > 0 else 0.0
+    return float(pnl), float(pnl_pct)
+
+
+def update_open_paper_trades(trades: pd.DataFrame) -> pd.DataFrame:
+    """
+    Update open paper trades using latest 1-minute yfinance data.
+    Closes a trade when stop or target_1 is reached.
+    """
+
+    if trades.empty:
+        return trades
+
+    trades = trades.copy()
+
+    open_indices = trades.index[trades["status"].eq("OPEN")].tolist()
+
+    for idx in open_indices:
+        ticker = str(trades.loc[idx, "ticker"])
+
+        try:
+            df = fetch_intraday_yfinance(
+                ticker=ticker,
+                days_back=7,
+                interval_minutes=1,
+            )
+            latest_day_df = get_latest_trading_day(df)
+
+            if latest_day_df.empty:
+                continue
+
+            latest_day_df = latest_day_df.sort_index()
+            current_price = float(latest_day_df.iloc[-1]["close"])
+
+            opened_at_raw = trades.loc[idx, "opened_at"]
+            try:
+                opened_at = pd.Timestamp(opened_at_raw)
+                if opened_at.tzinfo is None:
+                    opened_at = opened_at.tz_localize("America/New_York")
+                else:
+                    opened_at = opened_at.tz_convert("America/New_York")
+                after_entry = latest_day_df[latest_day_df.index >= opened_at]
+                if after_entry.empty:
+                    after_entry = latest_day_df.tail(1)
+            except Exception:
+                after_entry = latest_day_df.tail(1)
+
+            side = str(trades.loc[idx, "side"])
+            stop_price = float(trades.loc[idx, "stop_price"])
+            target_1 = float(trades.loc[idx, "target_1"])
+
+            exit_price = None
+            exit_reason = None
+            exit_time = None
+
+            if side == "LONG":
+                stop_hits = after_entry[after_entry["low"] <= stop_price]
+                target_hits = after_entry[after_entry["high"] >= target_1]
+
+                stop_time = stop_hits.index.min() if not stop_hits.empty else None
+                target_time = target_hits.index.min() if not target_hits.empty else None
+
+                if stop_time is not None and target_time is not None:
+                    if stop_time <= target_time:
+                        exit_price = stop_price
+                        exit_reason = "STOP"
+                        exit_time = stop_time
+                    else:
+                        exit_price = target_1
+                        exit_reason = "TARGET_1"
+                        exit_time = target_time
+                elif stop_time is not None:
+                    exit_price = stop_price
+                    exit_reason = "STOP"
+                    exit_time = stop_time
+                elif target_time is not None:
+                    exit_price = target_1
+                    exit_reason = "TARGET_1"
+                    exit_time = target_time
+
+            else:
+                stop_hits = after_entry[after_entry["high"] >= stop_price]
+                target_hits = after_entry[after_entry["low"] <= target_1]
+
+                stop_time = stop_hits.index.min() if not stop_hits.empty else None
+                target_time = target_hits.index.min() if not target_hits.empty else None
+
+                if stop_time is not None and target_time is not None:
+                    if stop_time <= target_time:
+                        exit_price = stop_price
+                        exit_reason = "STOP"
+                        exit_time = stop_time
+                    else:
+                        exit_price = target_1
+                        exit_reason = "TARGET_1"
+                        exit_time = target_time
+                elif stop_time is not None:
+                    exit_price = stop_price
+                    exit_reason = "STOP"
+                    exit_time = stop_time
+                elif target_time is not None:
+                    exit_price = target_1
+                    exit_reason = "TARGET_1"
+                    exit_time = target_time
+
+            if exit_price is not None:
+                pnl, pnl_pct = _calculate_trade_pnl(trades.loc[idx], float(exit_price))
+                trades.loc[idx, "current_price"] = float(exit_price)
+                trades.loc[idx, "pnl"] = pnl
+                trades.loc[idx, "pnl_pct"] = pnl_pct
+                trades.loc[idx, "status"] = "CLOSED"
+                trades.loc[idx, "exit_reason"] = exit_reason
+                trades.loc[idx, "closed_at"] = str(exit_time) if exit_time is not None else pd.Timestamp.now(tz="America/New_York").isoformat()
+            else:
+                pnl, pnl_pct = _calculate_trade_pnl(trades.loc[idx], current_price)
+                trades.loc[idx, "current_price"] = current_price
+                trades.loc[idx, "pnl"] = pnl
+                trades.loc[idx, "pnl_pct"] = pnl_pct
+
+        except Exception:
+            continue
+
+    save_paper_trades(trades)
+    return trades
+
+
+def paper_scan_and_open_trades(
+    ticker_options: dict[str, str],
+    cfg: AnalyzerConfig,
+    mode: str,
+    risk_dollars: float,
+    max_notional: float,
+    min_abs_score: int,
+    max_open_trades: int,
+) -> tuple[pd.DataFrame, list[str]]:
+    """
+    Update existing trades, scan tickers, and open new paper trades when signals exist.
+    """
+
+    trades = load_paper_trades()
+    trades = update_open_paper_trades(trades)
+
+    messages = []
+
+    open_count = int(trades["status"].eq("OPEN").sum()) if not trades.empty else 0
+
+    for display_name, ticker in list(ticker_options.items()):
+        if open_count >= int(max_open_trades):
+            messages.append("הגעת למקסימום עסקאות פתוחות.")
+            break
+
+        plans_to_try = []
+
+        try:
+            if mode in ["טווח בינוני 30-60 דקות", "שניהם"]:
+                df = fetch_intraday_yfinance(
+                    ticker=ticker,
+                    days_back=cfg.days_back,
+                    interval_minutes=cfg.bar_minutes,
+                )
+                latest_day_df = get_latest_trading_day(df)
+                if not latest_day_df.empty:
+                    plan = build_invest_now_plan(latest_day_df, cfg)
+                    plans_to_try.append(("30-60 דקות", plan))
+
+            if mode in ["טווח קצר 1-5 דקות", "שניהם"]:
+                micro_df = fetch_intraday_yfinance(
+                    ticker=ticker,
+                    days_back=min(int(cfg.days_back), 7),
+                    interval_minutes=1,
+                )
+                micro_latest_day_df = get_latest_trading_day(micro_df)
+                if not micro_latest_day_df.empty:
+                    micro_plan = build_micro_scalp_plan(micro_latest_day_df)
+                    plans_to_try.append(("1-5 דקות", micro_plan))
+
+        except Exception as e:
+            messages.append(f"{ticker}: שגיאה בסריקה: {str(e)[:120]}")
+            continue
+
+        for horizon, plan in plans_to_try:
+            if open_count >= int(max_open_trades):
+                break
+
+            score = int(plan.get("setup_score", 0) or 0)
+            if abs(score) < int(min_abs_score):
+                continue
+
+            trade = create_paper_trade_from_plan(
+                ticker=ticker,
+                horizon=horizon,
+                plan=plan,
+                risk_dollars=float(risk_dollars),
+                max_notional=float(max_notional),
+            )
+
+            if trade is None:
+                continue
+
+            if not trades.empty:
+                mask = get_open_trade_mask(trades, ticker=ticker, horizon=horizon)
+                if len(mask) > 0 and mask.any():
+                    continue
+
+            trades = pd.concat([trades, pd.DataFrame([trade])], ignore_index=True)
+            open_count += 1
+            messages.append(f"נפתחה עסקת נייר: {ticker} | {horizon} | {trade['side']}")
+
+            # Avoid opening both long and short for same ticker in same scan unless mode allows later; one new trade per ticker is enough.
+            break
+
+        time.sleep(0.25)
+
+    save_paper_trades(trades)
+    return trades, messages
+
+
+def paper_summary(trades: pd.DataFrame) -> dict:
+    if trades.empty:
+        return {
+            "open_trades": 0,
+            "closed_trades": 0,
+            "total_pnl": 0.0,
+            "closed_pnl": 0.0,
+            "win_rate": 0.0,
+        }
+
+    open_trades = trades[trades["status"].eq("OPEN")]
+    closed_trades = trades[trades["status"].eq("CLOSED")]
+
+    closed_count = len(closed_trades)
+    wins = int((closed_trades["pnl"].astype(float) > 0).sum()) if closed_count else 0
+
+    return {
+        "open_trades": int(len(open_trades)),
+        "closed_trades": int(closed_count),
+        "total_pnl": float(trades["pnl"].fillna(0).astype(float).sum()),
+        "closed_pnl": float(closed_trades["pnl"].fillna(0).astype(float).sum()) if closed_count else 0.0,
+        "win_rate": float((wins / closed_count) * 100) if closed_count else 0.0,
+    }
+
+
 # ============================================================
 # Tabs
 # ============================================================
 
-tab_single, tab_all, tab_live, tab_invest_now, tab_help = st.tabs(
+tab_single, tab_all, tab_live, tab_invest_now, tab_paper, tab_help = st.tabs(
     [
         "🔎 מניה אחת",
         "🚀 כמה מניות",
         "⏱️ יום אחרון / כמעט זמן אמת",
         "🎯 השקעה כעת",
+        "🧪 Paper Trading",
         "📘 הסבר",
     ]
 )
@@ -2622,6 +3058,203 @@ with tab_invest_now:
         if now_auto_refresh:
             time.sleep(20)
             st.rerun()
+
+
+
+# ============================================================
+# Paper Trading tab
+# ============================================================
+
+with tab_paper:
+    st.subheader("🧪 Paper Trading אוטומטי — בדמו בלבד")
+
+    st.markdown(
+        """
+<div class="warning-card">
+<strong>חשוב:</strong>
+זה לא שולח פקודות אמיתיות ולא מתחבר לברוקר. זה רק סימולציה על הנייר:
+האפליקציה פותחת עסקאות דמיוניות לפי האיתותים, מעדכנת מחיר, וסוגרת בסטופ או יעד ראשון.
+המטרה היא לבדוק אם השיטה עובדת לפני כסף אמיתי.
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+    p_col1, p_col2 = st.columns([1, 2])
+
+    with p_col1:
+        paper_mode = st.selectbox(
+            "איזה טווח לסחור על הנייר?",
+            options=["טווח קצר 1-5 דקות", "טווח בינוני 30-60 דקות", "שניהם"],
+            index=2,
+        )
+
+        paper_risk = st.number_input(
+            "סיכון דמיוני לעסקה ($)",
+            min_value=1.0,
+            max_value=1000.0,
+            value=25.0,
+            step=5.0,
+        )
+
+        paper_max_notional = st.number_input(
+            "מקסימום שווי עסקה דמיוני ($)",
+            min_value=50.0,
+            max_value=100000.0,
+            value=1000.0,
+            step=50.0,
+        )
+
+        paper_min_score = st.slider(
+            "מינימום ציון לפתיחת עסקת נייר",
+            min_value=1,
+            max_value=8,
+            value=3,
+            step=1,
+        )
+
+        paper_max_open = st.slider(
+            "מקסימום עסקאות פתוחות",
+            min_value=1,
+            max_value=20,
+            value=5,
+            step=1,
+        )
+
+        run_paper_once = st.button("▶️ הרץ Paper Scan עכשיו", use_container_width=True)
+        update_paper_now = st.button("🔄 עדכן עסקאות פתוחות", use_container_width=True)
+        paper_auto = st.checkbox("הפעל Paper Trading אוטומטי כל 30 שניות", value=False)
+
+        clear_paper = st.button("🧹 נקה את כל עסקאות הנייר", use_container_width=True)
+
+    with p_col2:
+        st.markdown(
+            """
+<div class="card">
+<h3>איך זה עובד?</h3>
+<ol>
+<li>האפליקציה סורקת את רשימת המניות.</li>
+<li>אם יש איתות לונג/שורט עם ציון מספיק גבוה — היא פותחת עסקת נייר.</li>
+<li>היא שומרת כניסה, סטופ, יעד, כמות דמיונית ורווח/הפסד.</li>
+<li>ברענון הבא היא בודקת אם המחיר הגיע לסטופ או ליעד ראשון.</li>
+</ol>
+<p class="small-muted">
+הסימולציה מבוססת על נתוני yfinance, שיכולים להיות מושהים ולא תמיד מדויקים בזמן אמת.
+</p>
+</div>
+""",
+            unsafe_allow_html=True,
+        )
+
+    if clear_paper:
+        clear_paper_trades()
+        st.success("כל עסקאות הנייר נמחקו.")
+        st.rerun()
+
+    if update_paper_now:
+        trades = load_paper_trades()
+        trades = update_open_paper_trades(trades)
+        st.success("עסקאות פתוחות עודכנו.")
+
+    if run_paper_once or paper_auto:
+        with st.spinner("מריץ Paper Trading: מעדכן עסקאות וסורק איתותים חדשים..."):
+            trades, paper_messages = paper_scan_and_open_trades(
+                ticker_options=get_all_ticker_options(),
+                cfg=cfg,
+                mode=paper_mode,
+                risk_dollars=paper_risk,
+                max_notional=paper_max_notional,
+                min_abs_score=paper_min_score,
+                max_open_trades=paper_max_open,
+            )
+
+        if paper_messages:
+            for msg in paper_messages[:12]:
+                st.info(msg)
+        else:
+            st.warning("לא נפתחו עסקאות נייר חדשות בסריקה הזו.")
+
+    trades = load_paper_trades()
+    trades = update_open_paper_trades(trades)
+    summary = paper_summary(trades)
+
+    s1, s2, s3, s4 = st.columns(4)
+    with s1:
+        st.metric("עסקאות פתוחות", summary["open_trades"])
+    with s2:
+        st.metric("עסקאות סגורות", summary["closed_trades"])
+    with s3:
+        st.metric("רווח/הפסד כולל", f"${summary['total_pnl']:.2f}")
+    with s4:
+        st.metric("Win Rate סגור", f"{summary['win_rate']:.1f}%")
+
+    if trades.empty:
+        st.info("עדיין אין עסקאות נייר.")
+    else:
+        open_trades = trades[trades["status"].eq("OPEN")].copy()
+        closed_trades = trades[trades["status"].eq("CLOSED")].copy()
+
+        st.markdown("### עסקאות פתוחות")
+        if open_trades.empty:
+            st.info("אין עסקאות פתוחות כרגע.")
+        else:
+            st.dataframe(
+                open_trades[
+                    [
+                        "opened_at",
+                        "ticker",
+                        "horizon",
+                        "side",
+                        "entry_price",
+                        "stop_price",
+                        "target_1",
+                        "current_price",
+                        "quantity",
+                        "pnl",
+                        "pnl_pct",
+                        "signal_score",
+                        "signal_quality",
+                    ]
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        st.markdown("### עסקאות סגורות")
+        if closed_trades.empty:
+            st.info("עדיין אין עסקאות סגורות.")
+        else:
+            st.dataframe(
+                closed_trades.sort_values("closed_at", ascending=False)[
+                    [
+                        "opened_at",
+                        "closed_at",
+                        "ticker",
+                        "horizon",
+                        "side",
+                        "entry_price",
+                        "stop_price",
+                        "target_1",
+                        "current_price",
+                        "quantity",
+                        "pnl",
+                        "pnl_pct",
+                        "exit_reason",
+                        "signal_score",
+                        "signal_quality",
+                    ]
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        st.markdown("### כל העסקאות הגולמיות")
+        with st.expander("פתח טבלה מלאה"):
+            st.dataframe(trades, use_container_width=True, hide_index=True)
+
+    if paper_auto:
+        time.sleep(30)
+        st.rerun()
 
 
 # ============================================================

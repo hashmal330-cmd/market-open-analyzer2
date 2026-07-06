@@ -1,3 +1,3 @@
-# Market Open Analyzer - Auto Scan
+# Market Open Analyzer - Paper Trading
 
-Educational Streamlit app. Not investment advice.
+Educational Streamlit app. Not investment advice. Paper trading only.
