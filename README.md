@@ -1,3 +1,3 @@
-# Market Open Analyzer 1m
+# Market Open Analyzer - Dual Horizon
 
 Educational Streamlit app. Not investment advice.

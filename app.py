@@ -192,7 +192,7 @@ class AnalyzerConfig:
 # Data fetching: yfinance
 # ============================================================
 
-@st.cache_data(show_spinner=False, ttl=60 * 10)
+@st.cache_data(show_spinner=False, ttl=20)
 def fetch_intraday_yfinance(
     ticker: str,
     days_back: int,
@@ -1221,7 +1221,7 @@ def build_invest_now_plan(latest_day_df: pd.DataFrame, cfg: AnalyzerConfig) -> d
             "stop": f"מתחת לתמיכה/EMA/VWAP: בערך {stop_price:.2f}",
             "target_1": f"יעד 1R: בערך {target_1:.2f}",
             "target_2": f"יעד 2R: בערך {target_2:.2f}",
-            "time_plan": "תרחיש intraday: לבדוק כל 15-30 דקות, לא להשאיר בלי סטופ, ולסגור לפני סוף המסחר אם אין תוכנית אחרת.",
+            "time_plan": "טווח בינוני 30-60 דקות: לבדוק כל 10-15 דקות, לא להשאיר בלי סטופ, ולסגור לפני סוף המסחר אם אין תוכנית אחרת.",
             "reason": "רוב האינדיקטורים תומכים בכיוון עולה. עדיין נדרש טריגר מחיר — לא להיכנס רק בגלל שהמערכת מציגה לונג.",
             "risk_reward": "בערך 1:1 ליעד ראשון ו־1:2 ליעד שני",
         })
@@ -1255,7 +1255,7 @@ def build_invest_now_plan(latest_day_df: pd.DataFrame, cfg: AnalyzerConfig) -> d
             "stop": f"מעל התנגדות/EMA/VWAP: בערך {stop_price:.2f}",
             "target_1": f"יעד 1R: בערך {target_1:.2f}",
             "target_2": f"יעד 2R: בערך {target_2:.2f}",
-            "time_plan": "תרחיש intraday: לבדוק כל 15-30 דקות, לא להשאיר בלי סטופ, ולסגור לפני סוף המסחר אם אין תוכנית אחרת.",
+            "time_plan": "טווח בינוני 30-60 דקות: לבדוק כל 10-15 דקות, לא להשאיר בלי סטופ, ולסגור לפני סוף המסחר אם אין תוכנית אחרת.",
             "reason": "רוב האינדיקטורים תומכים בכיוון יורד. עדיין נדרש טריגר מחיר — לא להיכנס רק בגלל שהמערכת מציגה שורט.",
             "risk_reward": "בערך 1:1 ליעד ראשון ו־1:2 ליעד שני",
         })
@@ -1277,6 +1277,237 @@ def build_invest_now_plan(latest_day_df: pd.DataFrame, cfg: AnalyzerConfig) -> d
     })
 
     return out
+
+
+
+def build_micro_scalp_plan(latest_day_df_1m: pd.DataFrame) -> dict:
+    """
+    Builds a very-short-term educational scalp scenario using 1-minute bars.
+
+    This is not investment advice. It is a rules-based paper-trading scenario
+    for the next 1-5 minutes only.
+    """
+
+    df = filter_regular_market_hours(latest_day_df_1m).copy()
+
+    base = {
+        "horizon": "טווח קצר מאוד — 1 עד 5 דקות",
+        "bias": "NO_TRADE",
+        "title_he": "סקאלפ קצר: אין טריגר נקי עכשיו",
+        "direction_he": "להמתין",
+        "confidence_he": "נמוכה",
+        "setup_score": 0,
+        "setup_quality": "חלש / מעורב",
+        "current_price": np.nan,
+        "current_time": "",
+        "entry_zone": "אין כניסה",
+        "trigger": "להמתין לשבירה/פריצה ברורה בנר דקה",
+        "stop": "לא רלוונטי",
+        "target_1": "לא רלוונטי",
+        "target_2": "לא רלוונטי",
+        "time_plan": "סקאלפ קצר: 1-5 דקות. אם אין תנועה מהירה לטובתך — יציאה.",
+        "reason": "אין מספיק אישור לטווח קצר מאוד.",
+        "filters_summary": "",
+        "risk_reward": "לא רלוונטי",
+        "ema5": np.nan,
+        "ema9": np.nan,
+        "ema21": np.nan,
+        "vwap": np.nan,
+        "rsi7": np.nan,
+        "micro_momentum_pct": np.nan,
+        "relative_volume": np.nan,
+        "atr_like": np.nan,
+    }
+
+    if df.empty or len(df) < 25:
+        out = base.copy()
+        out["reason"] = "אין מספיק נרות דקה כדי לבנות תרחיש סקאלפ."
+        return out
+
+    df = df.sort_index()
+
+    df["ema5"] = df["close"].ewm(span=5, adjust=False).mean()
+    df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
+    df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
+
+    typical_price = (df["high"] + df["low"] + df["close"]) / 3
+    df["vwap"] = (typical_price * df["volume"]).cumsum() / df["volume"].replace(0, np.nan).cumsum()
+
+    delta = df["close"].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / 7, adjust=False, min_periods=7).mean()
+    avg_loss = loss.ewm(alpha=1 / 7, adjust=False, min_periods=7).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    df["rsi7"] = 100 - (100 / (1 + rs))
+
+    df["bar_range"] = df["high"] - df["low"]
+    df["atr_like"] = df["bar_range"].rolling(10, min_periods=5).mean()
+    df["volume_ma10"] = df["volume"].rolling(10, min_periods=5).mean()
+    df["relative_volume"] = df["volume"] / df["volume_ma10"].replace(0, np.nan)
+    df["micro_momentum_pct"] = (df["close"] / df["close"].shift(3) - 1) * 100
+
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    current_price = _safe_float(last["close"])
+    current_time = str(df.index[-1])
+    ema5 = _safe_float(last["ema5"])
+    ema9 = _safe_float(last["ema9"])
+    ema21 = _safe_float(last["ema21"])
+    vwap = _safe_float(last["vwap"])
+    rsi7 = _safe_float(last["rsi7"])
+    momentum = _safe_float(last["micro_momentum_pct"])
+    rel_vol = _safe_float(last["relative_volume"])
+    atr_like = _safe_float(last["atr_like"], current_price * 0.0015)
+
+    last_3_high = _safe_float(df["high"].tail(3).max())
+    last_3_low = _safe_float(df["low"].tail(3).min())
+    last_8_high = _safe_float(df["high"].tail(8).max())
+    last_8_low = _safe_float(df["low"].tail(8).min())
+    prev_high = _safe_float(prev["high"])
+    prev_low = _safe_float(prev["low"])
+
+    score = 0
+    filters = []
+
+    if current_price > vwap:
+        score += 1
+        filters.append("מעל VWAP")
+    elif current_price < vwap:
+        score -= 1
+        filters.append("מתחת VWAP")
+
+    if current_price > ema5 > ema9 > ema21:
+        score += 2
+        filters.append("EMA5/9/21 מיושרים למעלה")
+    elif current_price < ema5 < ema9 < ema21:
+        score -= 2
+        filters.append("EMA5/9/21 מיושרים למטה")
+    elif current_price > ema9:
+        score += 1
+        filters.append("מחיר מעל EMA9")
+    elif current_price < ema9:
+        score -= 1
+        filters.append("מחיר מתחת EMA9")
+
+    if pd.notna(momentum):
+        if momentum > 0.05:
+            score += 1
+            filters.append("מומנטום 3 נרות חיובי")
+        elif momentum < -0.05:
+            score -= 1
+            filters.append("מומנטום 3 נרות שלילי")
+
+    if pd.notna(rsi7):
+        if 48 <= rsi7 <= 72:
+            score += 1
+            filters.append("RSI7 תומך בלונג")
+        elif 28 <= rsi7 <= 52:
+            score -= 1
+            filters.append("RSI7 תומך בשורט")
+        elif rsi7 > 82:
+            score -= 1
+            filters.append("RSI7 גבוה מדי — לא לרדוף לונג")
+        elif rsi7 < 18:
+            score += 1
+            filters.append("RSI7 נמוך מדי — לא לרדוף שורט")
+
+    if pd.notna(rel_vol):
+        if rel_vol >= 1.15:
+            filters.append("ווליום קצר גבוה יחסית")
+        elif rel_vol < 0.70:
+            filters.append("ווליום קצר חלש")
+            if score > 0:
+                score -= 1
+            elif score < 0:
+                score += 1
+
+    buffer_value = max(current_price * 0.0003, atr_like * 0.10)
+    min_risk = max(current_price * 0.0008, atr_like * 0.50)
+
+    if abs(score) >= 5:
+        setup_quality = "חזק"
+        confidence_he = "גבוהה יחסית"
+    elif abs(score) >= 3:
+        setup_quality = "בינוני"
+        confidence_he = "בינונית"
+    else:
+        setup_quality = "חלש / מעורב"
+        confidence_he = "נמוכה"
+
+    common = {
+        "current_price": current_price,
+        "current_time": current_time,
+        "setup_score": int(score),
+        "setup_quality": setup_quality,
+        "confidence_he": confidence_he,
+        "ema5": ema5,
+        "ema9": ema9,
+        "ema21": ema21,
+        "vwap": vwap,
+        "rsi7": rsi7,
+        "micro_momentum_pct": momentum,
+        "relative_volume": rel_vol,
+        "atr_like": atr_like,
+        "filters_summary": " | ".join(filters),
+    }
+
+    if score >= 3 and current_price > ema9 and current_price > vwap:
+        trigger_price = max(prev_high, last_3_high) + buffer_value
+        stop_price = min(last_8_low, ema21) - buffer_value
+        risk = max(trigger_price - stop_price, min_risk)
+        target_1 = trigger_price + 0.8 * risk
+        target_2 = trigger_price + 1.5 * risk
+
+        out = base.copy()
+        out.update(common)
+        out.update({
+            "bias": "MICRO_LONG",
+            "title_he": "סקאלפ קצר: לונג רק עם טריגר דקה",
+            "direction_he": "לונג קצר",
+            "entry_zone": f"{current_price:.2f} עד {trigger_price:.2f}",
+            "trigger": f"כניסה לימודית רק מעל {trigger_price:.2f} בנר דקה, עם נר שסוגר חזק.",
+            "stop": f"סטופ קצר מתחת {stop_price:.2f}",
+            "target_1": f"יעד מהיר 1: בערך {target_1:.2f}",
+            "target_2": f"יעד מהיר 2: בערך {target_2:.2f}",
+            "time_plan": "טווח קצר מאוד: 1-5 דקות. אם אחרי 1-2 נרות אין המשך — לצאת בדמו.",
+            "reason": "הסקור הקצר חיובי: מחיר/EMA/VWAP/מומנטום תומכים בתרחיש לונג קצר.",
+            "risk_reward": "בערך 0.8R עד 1.5R בסקאלפ",
+        })
+        return out
+
+    if score <= -3 and current_price < ema9 and current_price < vwap:
+        trigger_price = min(prev_low, last_3_low) - buffer_value
+        stop_price = max(last_8_high, ema21) + buffer_value
+        risk = max(stop_price - trigger_price, min_risk)
+        target_1 = trigger_price - 0.8 * risk
+        target_2 = trigger_price - 1.5 * risk
+
+        out = base.copy()
+        out.update(common)
+        out.update({
+            "bias": "MICRO_SHORT",
+            "title_he": "סקאלפ קצר: שורט רק עם טריגר דקה",
+            "direction_he": "שורט קצר",
+            "entry_zone": f"{trigger_price:.2f} עד {current_price:.2f}",
+            "trigger": f"כניסה לימודית רק מתחת {trigger_price:.2f} בנר דקה, עם נר שסוגר חלש.",
+            "stop": f"סטופ קצר מעל {stop_price:.2f}",
+            "target_1": f"יעד מהיר 1: בערך {target_1:.2f}",
+            "target_2": f"יעד מהיר 2: בערך {target_2:.2f}",
+            "time_plan": "טווח קצר מאוד: 1-5 דקות. אם אחרי 1-2 נרות אין המשך — לצאת בדמו.",
+            "reason": "הסקור הקצר שלילי: מחיר/EMA/VWAP/מומנטום תומכים בתרחיש שורט קצר.",
+            "risk_reward": "בערך 0.8R עד 1.5R בסקאלפ",
+        })
+        return out
+
+    out = base.copy()
+    out.update(common)
+    out.update({
+        "reason": "בטווח הדקה אין מספיק אישור. ייתכן שבטווח 30-60 דקות יש תמונה אחרת, אבל לסקאלפ קצר עדיף להמתין.",
+    })
+    return out
+
 
 
 def plot_candles_with_indicators(df: pd.DataFrame, title: str = "Current chart"):
@@ -1976,6 +2207,10 @@ def scan_ticker_list_for_now(
                     "bias": "NO_DATA",
                     "score": 0,
                     "quality": "N/A",
+                    "micro_direction": "N/A",
+                    "micro_bias": "N/A",
+                    "micro_score": 0,
+                    "micro_quality": "N/A",
                     "current_price": np.nan,
                     "change_from_open_pct": np.nan,
                     "rsi14": np.nan,
@@ -1991,6 +2226,22 @@ def scan_ticker_list_for_now(
 
             plan = build_invest_now_plan(latest_day_df, cfg)
 
+            try:
+                micro_df = fetch_intraday_yfinance(
+                    ticker=ticker,
+                    days_back=min(int(cfg.days_back), 7),
+                    interval_minutes=1,
+                )
+                micro_latest_day_df = get_latest_trading_day(micro_df)
+                micro_plan = build_micro_scalp_plan(micro_latest_day_df)
+            except Exception:
+                micro_plan = {
+                    "direction_he": "לא זמין",
+                    "bias": "MICRO_ERROR",
+                    "setup_score": 0,
+                    "setup_quality": "N/A",
+                }
+
             rows.append({
                 "name": display_name,
                 "ticker": ticker,
@@ -1998,6 +2249,10 @@ def scan_ticker_list_for_now(
                 "bias": plan.get("bias", ""),
                 "score": plan.get("setup_score", 0),
                 "quality": plan.get("setup_quality", ""),
+                "micro_direction": micro_plan.get("direction_he", ""),
+                "micro_bias": micro_plan.get("bias", ""),
+                "micro_score": micro_plan.get("setup_score", 0),
+                "micro_quality": micro_plan.get("setup_quality", ""),
                 "current_price": plan.get("current_price", np.nan),
                 "change_from_open_pct": plan.get("current_move_pct", np.nan),
                 "rsi14": plan.get("rsi14", np.nan),
@@ -2065,7 +2320,7 @@ with tab_invest_now:
 <div class="warning-card">
 <strong>חשוב:</strong>
 המסך הזה אינו ייעוץ השקעות ואינו הוראת קנייה/מכירה.
-הוא בונה תרחיש לימודי לפי נתונים זמינים, EMA20, EMA50, VWAP, מגמה וסיכון־סיכוי.
+הוא בונה תרחיש לימודי לפי נתונים זמינים: גם טווח קצר מאוד 1-5 דקות וגם טווח 30-60 דקות.
 לעבוד בדמו בלבד עד שיש לך שיטה מוכחת.
 </div>
 """,
@@ -2109,7 +2364,7 @@ with tab_invest_now:
 
         now_refresh = st.button("🔄 נתח עכשיו", use_container_width=True)
         scan_now_list = st.button("📋 סרוק את כל הרשימה ומצא הזדמנויות", use_container_width=True)
-        now_auto_refresh = st.checkbox("רענון אוטומטי כל 60 שניות", value=False, key="invest_now_auto")
+        now_auto_refresh = st.checkbox("רענון אוטומטי כל 20 שניות", value=False, key="invest_now_auto")
 
     with col_now_2:
         st.markdown(
@@ -2154,6 +2409,9 @@ with tab_invest_now:
                             "direction",
                             "score",
                             "quality",
+                            "micro_direction",
+                            "micro_score",
+                            "micro_quality",
                             "current_price",
                             "change_from_open_pct",
                             "rsi14",
@@ -2177,6 +2435,9 @@ with tab_invest_now:
                             "direction",
                             "score",
                             "quality",
+                            "micro_direction",
+                            "micro_score",
+                            "micro_quality",
                             "current_price",
                             "change_from_open_pct",
                             "reason",
@@ -2203,6 +2464,77 @@ with tab_invest_now:
                 st.warning("אין נתונים זמינים ליום המסחר האחרון.")
             else:
                 plan_now = build_invest_now_plan(latest_day_df, cfg)
+
+                try:
+                    micro_df = fetch_intraday_yfinance(
+                        ticker=now_ticker,
+                        days_back=min(int(cfg.days_back), 7),
+                        interval_minutes=1,
+                    )
+                    micro_latest_day_df = get_latest_trading_day(micro_df)
+                    micro_plan = build_micro_scalp_plan(micro_latest_day_df)
+                except Exception as micro_error:
+                    micro_plan = {
+                        "bias": "NO_TRADE",
+                        "title_he": "סקאלפ קצר: לא זמין כרגע",
+                        "direction_he": "להמתין",
+                        "confidence_he": "נמוכה",
+                        "setup_score": 0,
+                        "setup_quality": "N/A",
+                        "entry_zone": "לא זמין",
+                        "trigger": "לא זמין",
+                        "stop": "לא זמין",
+                        "target_1": "לא זמין",
+                        "target_2": "לא זמין",
+                        "time_plan": "לא זמין",
+                        "reason": str(micro_error)[:180],
+                        "filters_summary": "",
+                        "risk_reward": "לא זמין",
+                    }
+
+                st.markdown("### אינדיקציה לפי טווח זמן")
+
+                h_col_1, h_col_2 = st.columns(2)
+
+                with h_col_1:
+                    st.markdown(
+                        f"""
+<div class="card">
+<h3>⚡ טווח קצר מאוד — 1 עד 5 דקות</h3>
+<p><strong>כיוון:</strong> {micro_plan['direction_he']}</p>
+<p><strong>ביטחון:</strong> {micro_plan['confidence_he']}</p>
+<p><strong>ציון:</strong> {micro_plan['setup_score']} — {micro_plan['setup_quality']}</p>
+<p><strong>אזור כניסה:</strong> {micro_plan['entry_zone']}</p>
+<p><strong>טריגר:</strong> {micro_plan['trigger']}</p>
+<p><strong>סטופ:</strong> {micro_plan['stop']}</p>
+<p><strong>יעדים:</strong> {micro_plan['target_1']} | {micro_plan['target_2']}</p>
+<p><strong>לכמה זמן:</strong> {micro_plan['time_plan']}</p>
+<p><strong>למה:</strong> {micro_plan['reason']}</p>
+<p class="small-muted">זה מיועד לסקאלפ קצר בלבד. אם אין טריגר בנר דקה — אין כניסה.</p>
+</div>
+""",
+                        unsafe_allow_html=True,
+                    )
+
+                with h_col_2:
+                    st.markdown(
+                        f"""
+<div class="card">
+<h3>🕒 טווח בינוני — 30 עד 60 דקות</h3>
+<p><strong>כיוון:</strong> {plan_now['direction_he']}</p>
+<p><strong>ביטחון:</strong> {plan_now['confidence_he']}</p>
+<p><strong>ציון:</strong> {plan_now['setup_score']} — {plan_now['setup_quality']}</p>
+<p><strong>אזור כניסה:</strong> {plan_now['entry_zone']}</p>
+<p><strong>טריגר:</strong> {plan_now['trigger']}</p>
+<p><strong>סטופ:</strong> {plan_now['stop']}</p>
+<p><strong>יעדים:</strong> {plan_now['target_1']} | {plan_now['target_2']}</p>
+<p><strong>לכמה זמן:</strong> {plan_now['time_plan']}</p>
+<p><strong>למה:</strong> {plan_now['reason']}</p>
+<p class="small-muted">יכול להיות שאין עסקה בטווח 30-60 דקות אבל יש סקאלפ קצר, או להפך.</p>
+</div>
+""",
+                        unsafe_allow_html=True,
+                    )
 
                 if plan_now["bias"] == "LONG_WATCH":
                     st.success(plan_now["title_he"])
@@ -2270,13 +2602,16 @@ with tab_invest_now:
                     st.plotly_chart(fig_now, use_container_width=True)
 
                 st.markdown("### נתונים גולמיים של התרחיש")
+                st.markdown("#### טווח בינוני 30-60 דקות")
                 st.dataframe(pd.DataFrame([plan_now]), use_container_width=True, hide_index=True)
+                st.markdown("#### טווח קצר מאוד 1-5 דקות")
+                st.dataframe(pd.DataFrame([micro_plan]), use_container_width=True, hide_index=True)
 
         except Exception as e:
             st.error(f"שגיאה: {e}")
 
         if now_auto_refresh:
-            time.sleep(60)
+            time.sleep(20)
             st.rerun()
 
 
