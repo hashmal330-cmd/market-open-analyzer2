@@ -204,7 +204,14 @@ def fetch_intraday_yfinance(
     """
 
     interval = f"{interval_minutes}m"
-    period = f"{days_back}d"
+
+    # Yahoo/yfinance usually limits 1-minute candles to a short recent window.
+    # To avoid download errors, the app automatically limits 1m to 7 days.
+    effective_days_back = int(days_back)
+    if int(interval_minutes) == 1:
+        effective_days_back = min(effective_days_back, 7)
+
+    period = f"{effective_days_back}d"
 
     df = yf.download(
         tickers=ticker,
@@ -1497,8 +1504,9 @@ days_back = st.sidebar.slider(
 
 bar_minutes = st.sidebar.selectbox(
     "גודל נר",
-    options=[5, 15, 30, 60],
-    index=0,
+    options=[1, 5, 15, 30, 60],
+    index=1,
+    help="נר 1 דקה עובד רק על תקופה קצרה יותר ב-yfinance, לכן האפליקציה תגביל אותו אוטומטית.",
 )
 
 first_window_minutes = st.sidebar.selectbox(
@@ -1557,6 +1565,9 @@ cfg = AnalyzerConfig(
     retrace_fraction=float(retrace_fraction),
     min_samples=int(min_samples),
 )
+
+if int(bar_minutes) == 1 and int(days_back) > 7:
+    st.sidebar.warning("בחרת נר 1 דקה. בגלל מגבלת yfinance, האפליקציה תשתמש בפועל רק עד 7 ימים אחורה.")
 
 
 # ============================================================
