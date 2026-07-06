@@ -1847,8 +1847,36 @@ PAPER_COLUMNS = [
     "quantity",
     "notional",
     "risk_dollars",
+
+    # Cost model
+    "cost_pct_per_side",
+    "fixed_fee_per_side",
+    "min_fee_per_side",
+    "max_cost_to_target_pct",
+
+    # Costs
+    "estimated_entry_cost",
+    "estimated_exit_cost",
+    "total_trade_cost",
+    "commission_per_trade",
+
+    # Gross and net PnL
+    "gross_pnl",
+    "gross_pnl_pct",
+    "net_pnl",
+    "net_pnl_pct",
+
+    # Backward-compatible names used by older UI parts.
     "pnl",
     "pnl_pct",
+
+    # Tradeoff / expectancy at entry
+    "expected_gross_to_target",
+    "expected_total_cost_to_target",
+    "expected_net_to_target",
+    "cost_to_target_ratio_pct",
+    "tradeoff_status",
+
     "exit_reason",
     "signal_score",
     "signal_quality",
@@ -1874,6 +1902,124 @@ def _extract_last_number(text_value) -> float:
         return float(matches[-1])
     except Exception:
         return np.nan
+
+
+def _to_float(value, default: float = 0.0) -> float:
+    try:
+        if pd.isna(value):
+            return float(default)
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def calculate_side_cost(
+    side_notional: float,
+    cost_pct_per_side: float = 0.02,
+    fixed_fee_per_side: float = 0.0,
+    min_fee_per_side: float = 0.0,
+) -> float:
+    """
+    Calculate estimated cost for one side of a trade.
+
+    cost_pct_per_side is in percent.
+    Example: 0.02 means 0.02% per side, about 0.04% round trip.
+    """
+    side_notional = max(float(side_notional), 0.0)
+    variable_cost = side_notional * (float(cost_pct_per_side) / 100.0)
+    raw_cost = variable_cost + float(fixed_fee_per_side)
+    return float(max(raw_cost, float(min_fee_per_side)))
+
+
+def estimate_trade_costs(
+    entry_price: float,
+    exit_price: float,
+    quantity: float,
+    cost_pct_per_side: float = 0.02,
+    fixed_fee_per_side: float = 0.0,
+    min_fee_per_side: float = 0.0,
+) -> tuple[float, float, float]:
+    """
+    Return entry_cost, exit_cost, total_cost.
+    """
+    entry_notional = abs(float(entry_price) * float(quantity))
+    exit_notional = abs(float(exit_price) * float(quantity))
+
+    entry_cost = calculate_side_cost(
+        entry_notional,
+        cost_pct_per_side=cost_pct_per_side,
+        fixed_fee_per_side=fixed_fee_per_side,
+        min_fee_per_side=min_fee_per_side,
+    )
+
+    exit_cost = calculate_side_cost(
+        exit_notional,
+        cost_pct_per_side=cost_pct_per_side,
+        fixed_fee_per_side=fixed_fee_per_side,
+        min_fee_per_side=min_fee_per_side,
+    )
+
+    return float(entry_cost), float(exit_cost), float(entry_cost + exit_cost)
+
+
+def evaluate_trade_after_cost(
+    side: str,
+    entry_price: float,
+    target_price: float,
+    quantity: float,
+    cost_pct_per_side: float,
+    fixed_fee_per_side: float,
+    min_fee_per_side: float,
+    max_cost_to_target_pct: float,
+) -> dict:
+    """
+    Evaluate whether the expected move to target is still worthwhile after costs.
+    """
+    entry_price = float(entry_price)
+    target_price = float(target_price)
+    quantity = float(quantity)
+
+    if str(side) == "LONG":
+        expected_gross = (target_price - entry_price) * quantity
+    else:
+        expected_gross = (entry_price - target_price) * quantity
+
+    entry_cost, exit_cost, total_cost = estimate_trade_costs(
+        entry_price=entry_price,
+        exit_price=target_price,
+        quantity=quantity,
+        cost_pct_per_side=cost_pct_per_side,
+        fixed_fee_per_side=fixed_fee_per_side,
+        min_fee_per_side=min_fee_per_side,
+    )
+
+    expected_net = expected_gross - total_cost
+
+    if expected_gross > 0:
+        cost_ratio = (total_cost / expected_gross) * 100.0
+    else:
+        cost_ratio = 999.0
+
+    if expected_net <= 0:
+        status = "לא כדאי אחרי עלויות"
+        is_worth_it = False
+    elif cost_ratio > float(max_cost_to_target_pct):
+        status = "גבולי/לא כדאי - העלות גדולה מדי ביחס ליעד"
+        is_worth_it = False
+    else:
+        status = "כדאי לבדיקה בדמו אחרי עלויות"
+        is_worth_it = True
+
+    return {
+        "expected_gross_to_target": float(expected_gross),
+        "expected_total_cost_to_target": float(total_cost),
+        "expected_net_to_target": float(expected_net),
+        "cost_to_target_ratio_pct": float(cost_ratio),
+        "tradeoff_status": status,
+        "is_worth_it": bool(is_worth_it),
+        "entry_cost_to_target": float(entry_cost),
+        "exit_cost_to_target": float(exit_cost),
+    }
 
 
 def load_paper_trades() -> pd.DataFrame:
@@ -1930,10 +2076,16 @@ def create_paper_trade_from_plan(
     plan: dict,
     risk_dollars: float = 25.0,
     max_notional: float = 1000.0,
-) -> dict | None:
+    cost_pct_per_side: float = 0.02,
+    fixed_fee_per_side: float = 0.0,
+    min_fee_per_side: float = 0.0,
+    max_cost_to_target_pct: float = 25.0,
+) -> tuple[dict | None, str]:
     """
     Create a paper trade from an educational plan.
     This does not execute any real order.
+
+    Returns: trade dict or None, message.
     """
 
     bias = str(plan.get("bias", ""))
@@ -1943,7 +2095,7 @@ def create_paper_trade_from_plan(
     elif bias in ["SHORT_WATCH", "MICRO_SHORT"]:
         side = "SHORT"
     else:
-        return None
+        return None, "אין איתות לונג/שורט."
 
     entry_price = _safe_float(plan.get("current_price", np.nan))
     stop_price = _extract_last_number(plan.get("stop", ""))
@@ -1951,36 +2103,65 @@ def create_paper_trade_from_plan(
     target_2 = _extract_last_number(plan.get("target_2", ""))
 
     if not np.isfinite(entry_price) or entry_price <= 0:
-        return None
+        return None, "מחיר כניסה לא תקין."
     if not np.isfinite(stop_price) or stop_price <= 0:
-        return None
+        return None, "סטופ לא תקין."
     if not np.isfinite(target_1) or target_1 <= 0:
-        return None
+        return None, "יעד ראשון לא תקין."
 
     if side == "LONG":
         if stop_price >= entry_price or target_1 <= entry_price:
-            return None
+            return None, "מבנה לונג לא תקין: יעד/סטופ לא בכיוון נכון."
     else:
         if stop_price <= entry_price or target_1 >= entry_price:
-            return None
+            return None, "מבנה שורט לא תקין: יעד/סטופ לא בכיוון נכון."
 
     risk_per_share = abs(entry_price - stop_price)
     if risk_per_share <= 0:
-        return None
+        return None, "סיכון למניה לא תקין."
 
     quantity = float(risk_dollars) / risk_per_share
 
     if max_notional and max_notional > 0:
         quantity = min(quantity, float(max_notional) / entry_price)
 
-    quantity = max(quantity, 0)
+    quantity = max(float(quantity), 0.0)
 
     if quantity <= 0:
-        return None
+        return None, "כמות דמיונית לא תקינה."
+
+    # Tradeoff: only open if the target is still worthwhile after entry+exit costs.
+    tradeoff = evaluate_trade_after_cost(
+        side=side,
+        entry_price=entry_price,
+        target_price=target_1,
+        quantity=quantity,
+        cost_pct_per_side=cost_pct_per_side,
+        fixed_fee_per_side=fixed_fee_per_side,
+        min_fee_per_side=min_fee_per_side,
+        max_cost_to_target_pct=max_cost_to_target_pct,
+    )
+
+    if not tradeoff["is_worth_it"]:
+        return None, (
+            f"דילוג אחרי עלויות: {tradeoff['tradeoff_status']} | "
+            f"ברוטו ליעד ${tradeoff['expected_gross_to_target']:.2f}, "
+            f"עלות ${tradeoff['expected_total_cost_to_target']:.2f}, "
+            f"נטו ${tradeoff['expected_net_to_target']:.2f}"
+        )
+
+    entry_cost, exit_cost_now, total_cost_now = estimate_trade_costs(
+        entry_price=entry_price,
+        exit_price=entry_price,
+        quantity=quantity,
+        cost_pct_per_side=cost_pct_per_side,
+        fixed_fee_per_side=fixed_fee_per_side,
+        min_fee_per_side=min_fee_per_side,
+    )
 
     now_ts = pd.Timestamp.now(tz="America/New_York").isoformat()
 
-    return {
+    trade = {
         "trade_id": f"{ticker}_{horizon}_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S_%f')}",
         "opened_at": now_ts,
         "closed_at": "",
@@ -1996,41 +2177,128 @@ def create_paper_trade_from_plan(
         "quantity": float(quantity),
         "notional": float(quantity * entry_price),
         "risk_dollars": float(risk_dollars),
-        "pnl": 0.0,
-        "pnl_pct": 0.0,
+
+        "cost_pct_per_side": float(cost_pct_per_side),
+        "fixed_fee_per_side": float(fixed_fee_per_side),
+        "min_fee_per_side": float(min_fee_per_side),
+        "max_cost_to_target_pct": float(max_cost_to_target_pct),
+
+        "estimated_entry_cost": float(entry_cost),
+        "estimated_exit_cost": float(exit_cost_now),
+        "total_trade_cost": float(total_cost_now),
+        "commission_per_trade": float(total_cost_now),
+
+        "gross_pnl": 0.0,
+        "gross_pnl_pct": 0.0,
+        "net_pnl": -float(total_cost_now),
+        "net_pnl_pct": (-float(total_cost_now) / float(quantity * entry_price)) * 100 if quantity * entry_price > 0 else 0.0,
+
+        "pnl": -float(total_cost_now),
+        "pnl_pct": (-float(total_cost_now) / float(quantity * entry_price)) * 100 if quantity * entry_price > 0 else 0.0,
+
+        "expected_gross_to_target": float(tradeoff["expected_gross_to_target"]),
+        "expected_total_cost_to_target": float(tradeoff["expected_total_cost_to_target"]),
+        "expected_net_to_target": float(tradeoff["expected_net_to_target"]),
+        "cost_to_target_ratio_pct": float(tradeoff["cost_to_target_ratio_pct"]),
+        "tradeoff_status": str(tradeoff["tradeoff_status"]),
+
         "exit_reason": "",
         "signal_score": int(plan.get("setup_score", 0) or 0),
         "signal_quality": str(plan.get("setup_quality", "")),
         "reason": str(plan.get("reason", ""))[:350],
     }
 
+    return trade, "עסקת נייר נפתחה אחרי בדיקת עלויות."
 
-def _calculate_trade_pnl(row, current_price: float) -> tuple[float, float]:
-    entry = float(row["entry_price"])
-    qty = float(row["quantity"])
+
+def _calculate_trade_pnl_with_costs(row, current_price: float) -> dict:
+    """
+    Calculate gross/net PnL and current estimated total costs.
+    """
+    entry = _to_float(row.get("entry_price", np.nan), 0.0)
+    qty = _to_float(row.get("quantity", np.nan), 0.0)
+
     if entry <= 0 or qty <= 0:
-        return 0.0, 0.0
+        return {
+            "gross_pnl": 0.0,
+            "gross_pnl_pct": 0.0,
+            "net_pnl": 0.0,
+            "net_pnl_pct": 0.0,
+            "estimated_entry_cost": 0.0,
+            "estimated_exit_cost": 0.0,
+            "total_trade_cost": 0.0,
+            "commission_per_trade": 0.0,
+        }
 
-    if str(row["side"]) == "LONG":
-        pnl = (current_price - entry) * qty
+    current_price = float(current_price)
+
+    if str(row.get("side", "")) == "LONG":
+        gross_pnl = (current_price - entry) * qty
     else:
-        pnl = (entry - current_price) * qty
+        gross_pnl = (entry - current_price) * qty
 
     notional = entry * qty
-    pnl_pct = (pnl / notional) * 100 if notional > 0 else 0.0
-    return float(pnl), float(pnl_pct)
+    gross_pnl_pct = (gross_pnl / notional) * 100 if notional > 0 else 0.0
+
+    cost_pct_per_side = _to_float(row.get("cost_pct_per_side", 0.02), 0.02)
+    fixed_fee_per_side = _to_float(row.get("fixed_fee_per_side", 0.0), 0.0)
+    min_fee_per_side = _to_float(row.get("min_fee_per_side", 0.0), 0.0)
+
+    entry_cost = _to_float(row.get("estimated_entry_cost", np.nan), np.nan)
+    if not np.isfinite(entry_cost):
+        entry_cost = calculate_side_cost(
+            notional,
+            cost_pct_per_side=cost_pct_per_side,
+            fixed_fee_per_side=fixed_fee_per_side,
+            min_fee_per_side=min_fee_per_side,
+        )
+
+    exit_cost = calculate_side_cost(
+        abs(current_price * qty),
+        cost_pct_per_side=cost_pct_per_side,
+        fixed_fee_per_side=fixed_fee_per_side,
+        min_fee_per_side=min_fee_per_side,
+    )
+
+    total_cost = entry_cost + exit_cost
+    net_pnl = gross_pnl - total_cost
+    net_pnl_pct = (net_pnl / notional) * 100 if notional > 0 else 0.0
+
+    return {
+        "gross_pnl": float(gross_pnl),
+        "gross_pnl_pct": float(gross_pnl_pct),
+        "net_pnl": float(net_pnl),
+        "net_pnl_pct": float(net_pnl_pct),
+        "estimated_entry_cost": float(entry_cost),
+        "estimated_exit_cost": float(exit_cost),
+        "total_trade_cost": float(total_cost),
+        "commission_per_trade": float(total_cost),
+    }
+
+
+def _calculate_trade_pnl(row, current_price: float) -> tuple[float, float]:
+    """
+    Backward compatible: returns net pnl and net pnl percent.
+    """
+    calc = _calculate_trade_pnl_with_costs(row, current_price)
+    return float(calc["net_pnl"]), float(calc["net_pnl_pct"])
 
 
 def update_open_paper_trades(trades: pd.DataFrame) -> pd.DataFrame:
     """
     Update open paper trades using latest 1-minute yfinance data.
     Closes a trade when stop or target_1 is reached.
+    Costs are included, so pnl is net after estimated entry+exit costs.
     """
 
     if trades.empty:
         return trades
 
     trades = trades.copy()
+
+    for col in PAPER_COLUMNS:
+        if col not in trades.columns:
+            trades[col] = np.nan
 
     open_indices = trades.index[trades["status"].eq("OPEN")].tolist()
 
@@ -2122,19 +2390,27 @@ def update_open_paper_trades(trades: pd.DataFrame) -> pd.DataFrame:
                     exit_reason = "TARGET_1"
                     exit_time = target_time
 
+            price_for_calc = float(exit_price) if exit_price is not None else float(current_price)
+            calc = _calculate_trade_pnl_with_costs(trades.loc[idx], price_for_calc)
+
+            trades.loc[idx, "current_price"] = price_for_calc
+            trades.loc[idx, "estimated_entry_cost"] = calc["estimated_entry_cost"]
+            trades.loc[idx, "estimated_exit_cost"] = calc["estimated_exit_cost"]
+            trades.loc[idx, "total_trade_cost"] = calc["total_trade_cost"]
+            trades.loc[idx, "commission_per_trade"] = calc["commission_per_trade"]
+            trades.loc[idx, "gross_pnl"] = calc["gross_pnl"]
+            trades.loc[idx, "gross_pnl_pct"] = calc["gross_pnl_pct"]
+            trades.loc[idx, "net_pnl"] = calc["net_pnl"]
+            trades.loc[idx, "net_pnl_pct"] = calc["net_pnl_pct"]
+
+            # Backward compatible display fields.
+            trades.loc[idx, "pnl"] = calc["net_pnl"]
+            trades.loc[idx, "pnl_pct"] = calc["net_pnl_pct"]
+
             if exit_price is not None:
-                pnl, pnl_pct = _calculate_trade_pnl(trades.loc[idx], float(exit_price))
-                trades.loc[idx, "current_price"] = float(exit_price)
-                trades.loc[idx, "pnl"] = pnl
-                trades.loc[idx, "pnl_pct"] = pnl_pct
                 trades.loc[idx, "status"] = "CLOSED"
                 trades.loc[idx, "exit_reason"] = exit_reason
                 trades.loc[idx, "closed_at"] = str(exit_time) if exit_time is not None else pd.Timestamp.now(tz="America/New_York").isoformat()
-            else:
-                pnl, pnl_pct = _calculate_trade_pnl(trades.loc[idx], current_price)
-                trades.loc[idx, "current_price"] = current_price
-                trades.loc[idx, "pnl"] = pnl
-                trades.loc[idx, "pnl_pct"] = pnl_pct
 
         except Exception:
             continue
@@ -2151,9 +2427,14 @@ def paper_scan_and_open_trades(
     max_notional: float,
     min_abs_score: int,
     max_open_trades: int,
+    cost_pct_per_side: float = 0.02,
+    fixed_fee_per_side: float = 0.0,
+    min_fee_per_side: float = 0.0,
+    max_cost_to_target_pct: float = 25.0,
 ) -> tuple[pd.DataFrame, list[str]]:
     """
     Update existing trades, scan tickers, and open new paper trades when signals exist.
+    Includes cost tradeoff before opening a paper trade.
     """
 
     trades = load_paper_trades()
@@ -2205,27 +2486,37 @@ def paper_scan_and_open_trades(
             if abs(score) < int(min_abs_score):
                 continue
 
-            trade = create_paper_trade_from_plan(
-                ticker=ticker,
-                horizon=horizon,
-                plan=plan,
-                risk_dollars=float(risk_dollars),
-                max_notional=float(max_notional),
-            )
-
-            if trade is None:
-                continue
-
             if not trades.empty:
                 mask = get_open_trade_mask(trades, ticker=ticker, horizon=horizon)
                 if len(mask) > 0 and mask.any():
                     continue
 
+            trade, message = create_paper_trade_from_plan(
+                ticker=ticker,
+                horizon=horizon,
+                plan=plan,
+                risk_dollars=float(risk_dollars),
+                max_notional=float(max_notional),
+                cost_pct_per_side=float(cost_pct_per_side),
+                fixed_fee_per_side=float(fixed_fee_per_side),
+                min_fee_per_side=float(min_fee_per_side),
+                max_cost_to_target_pct=float(max_cost_to_target_pct),
+            )
+
+            if trade is None:
+                if "דילוג אחרי עלויות" in message:
+                    messages.append(f"{ticker} | {horizon}: {message}")
+                continue
+
             trades = pd.concat([trades, pd.DataFrame([trade])], ignore_index=True)
             open_count += 1
-            messages.append(f"נפתחה עסקת נייר: {ticker} | {horizon} | {trade['side']}")
+            messages.append(
+                f"נפתחה עסקת נייר: {ticker} | {horizon} | {trade['side']} | "
+                f"עלות משוערת ${trade['commission_per_trade']:.2f} | "
+                f"נטו צפוי ליעד ${trade['expected_net_to_target']:.2f}"
+            )
 
-            # Avoid opening both long and short for same ticker in same scan unless mode allows later; one new trade per ticker is enough.
+            # One new trade per ticker per scan is enough.
             break
 
         time.sleep(0.25)
@@ -2239,24 +2530,62 @@ def paper_summary(trades: pd.DataFrame) -> dict:
         return {
             "open_trades": 0,
             "closed_trades": 0,
-            "total_pnl": 0.0,
-            "closed_pnl": 0.0,
+            "total_gross_pnl": 0.0,
+            "total_costs": 0.0,
+            "total_net_pnl": 0.0,
+            "closed_net_pnl": 0.0,
             "win_rate": 0.0,
         }
+
+    for col in PAPER_COLUMNS:
+        if col not in trades.columns:
+            trades[col] = np.nan
 
     open_trades = trades[trades["status"].eq("OPEN")]
     closed_trades = trades[trades["status"].eq("CLOSED")]
 
     closed_count = len(closed_trades)
-    wins = int((closed_trades["pnl"].astype(float) > 0).sum()) if closed_count else 0
+    wins = int((closed_trades["net_pnl"].fillna(0).astype(float) > 0).sum()) if closed_count else 0
 
     return {
         "open_trades": int(len(open_trades)),
         "closed_trades": int(closed_count),
-        "total_pnl": float(trades["pnl"].fillna(0).astype(float).sum()),
-        "closed_pnl": float(closed_trades["pnl"].fillna(0).astype(float).sum()) if closed_count else 0.0,
+        "total_gross_pnl": float(trades["gross_pnl"].fillna(0).astype(float).sum()),
+        "total_costs": float(trades["total_trade_cost"].fillna(0).astype(float).sum()),
+        "total_net_pnl": float(trades["net_pnl"].fillna(0).astype(float).sum()),
+        "closed_net_pnl": float(closed_trades["net_pnl"].fillna(0).astype(float).sum()) if closed_count else 0.0,
         "win_rate": float((wins / closed_count) * 100) if closed_count else 0.0,
     }
+
+
+def paper_cost_summary_by_ticker(trades: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aggregate gross PnL, costs and net PnL per ticker.
+    """
+    if trades.empty:
+        return pd.DataFrame()
+
+    for col in PAPER_COLUMNS:
+        if col not in trades.columns:
+            trades[col] = np.nan
+
+    out = (
+        trades.groupby("ticker")
+        .agg(
+            trades_count=("trade_id", "count"),
+            open_trades=("status", lambda s: int((s == "OPEN").sum())),
+            closed_trades=("status", lambda s: int((s == "CLOSED").sum())),
+            gross_pnl=("gross_pnl", "sum"),
+            total_costs=("total_trade_cost", "sum"),
+            net_pnl=("net_pnl", "sum"),
+            avg_commission_per_trade=("commission_per_trade", "mean"),
+            avg_cost_to_target_ratio_pct=("cost_to_target_ratio_pct", "mean"),
+        )
+        .reset_index()
+        .sort_values("net_pnl", ascending=False)
+    )
+
+    return out
 
 
 # ============================================================
@@ -3066,15 +3395,14 @@ with tab_invest_now:
 # ============================================================
 
 with tab_paper:
-    st.subheader("🧪 Paper Trading אוטומטי — בדמו בלבד")
+    st.subheader("🧪 Paper Trading אוטומטי — כולל עלויות קנייה/מכירה")
 
     st.markdown(
         """
 <div class="warning-card">
 <strong>חשוב:</strong>
-זה לא שולח פקודות אמיתיות ולא מתחבר לברוקר. זה רק סימולציה על הנייר:
-האפליקציה פותחת עסקאות דמיוניות לפי האיתותים, מעדכנת מחיר, וסוגרת בסטופ או יעד ראשון.
-המטרה היא לבדוק אם השיטה עובדת לפני כסף אמיתי.
+זה לא שולח פקודות אמיתיות ולא מתחבר לברוקר. זה רק סימולציה על הנייר.
+כעת הסימולציה כוללת גם עלות קנייה, עלות מכירה, רווח ברוטו, סך עלויות ורווח נטו אחרי עלויות.
 </div>
 """,
         unsafe_allow_html=True,
@@ -3105,6 +3433,43 @@ with tab_paper:
             step=50.0,
         )
 
+        st.markdown("#### מודל עלויות")
+
+        paper_cost_pct_side = st.number_input(
+            "עלות משתנה לכל צד (%)",
+            min_value=0.0,
+            max_value=2.0,
+            value=0.02,
+            step=0.01,
+            help="0.02% לכל צד = בערך 0.04% קנייה+מכירה. זה כולל הערכת spread/slippage/עמלות.",
+        )
+
+        paper_fixed_fee_side = st.number_input(
+            "עמלה קבועה לכל צד ($)",
+            min_value=0.0,
+            max_value=100.0,
+            value=0.0,
+            step=0.10,
+            help="למשל $1 בקנייה ועוד $1 במכירה.",
+        )
+
+        paper_min_fee_side = st.number_input(
+            "מינימום עמלה לכל צד ($)",
+            min_value=0.0,
+            max_value=100.0,
+            value=0.0,
+            step=0.10,
+        )
+
+        paper_max_cost_to_target = st.slider(
+            "מקסימום עלות מתוך היעד (%)",
+            min_value=1,
+            max_value=100,
+            value=25,
+            step=1,
+            help="אם העלות קנייה+מכירה גדולה מדי ביחס לרווח הצפוי ליעד — האפליקציה לא תפתח עסקת נייר.",
+        )
+
         paper_min_score = st.slider(
             "מינימום ציון לפתיחת עסקת נייר",
             min_value=1,
@@ -3129,17 +3494,15 @@ with tab_paper:
 
     with p_col2:
         st.markdown(
-            """
+            f"""
 <div class="card">
-<h3>איך זה עובד?</h3>
-<ol>
-<li>האפליקציה סורקת את רשימת המניות.</li>
-<li>אם יש איתות לונג/שורט עם ציון מספיק גבוה — היא פותחת עסקת נייר.</li>
-<li>היא שומרת כניסה, סטופ, יעד, כמות דמיונית ורווח/הפסד.</li>
-<li>ברענון הבא היא בודקת אם המחיר הגיע לסטופ או ליעד ראשון.</li>
-</ol>
+<h3>איך חישוב העלות עובד?</h3>
+<p><strong>עלות לכל צד:</strong> {paper_cost_pct_side:.3f}% + ${paper_fixed_fee_side:.2f}, מינימום ${paper_min_fee_side:.2f}</p>
+<p><strong>עלות round trip:</strong> קנייה + מכירה.</p>
+<p><strong>טריידאוף:</strong> לפני פתיחת עסקת נייר, האפליקציה בודקת אם הרווח הצפוי ליעד ראשון עדיין חיובי אחרי עלויות.</p>
+<p><strong>סינון:</strong> אם העלות גדולה מ־{paper_max_cost_to_target}% מהרווח הצפוי ליעד — העסקה לא נפתחת.</p>
 <p class="small-muted">
-הסימולציה מבוססת על נתוני yfinance, שיכולים להיות מושהים ולא תמיד מדויקים בזמן אמת.
+זה מודל הערכה בלבד. במציאות העלות תלויה בברוקר, ספרד, החלקה, נזילות וסוג פקודה.
 </p>
 </div>
 """,
@@ -3154,10 +3517,10 @@ with tab_paper:
     if update_paper_now:
         trades = load_paper_trades()
         trades = update_open_paper_trades(trades)
-        st.success("עסקאות פתוחות עודכנו.")
+        st.success("עסקאות פתוחות עודכנו כולל עלויות.")
 
     if run_paper_once or paper_auto:
-        with st.spinner("מריץ Paper Trading: מעדכן עסקאות וסורק איתותים חדשים..."):
+        with st.spinner("מריץ Paper Trading: מעדכן עסקאות, בודק עלויות וסורק איתותים חדשים..."):
             trades, paper_messages = paper_scan_and_open_trades(
                 ticker_options=get_all_ticker_options(),
                 cfg=cfg,
@@ -3166,11 +3529,21 @@ with tab_paper:
                 max_notional=paper_max_notional,
                 min_abs_score=paper_min_score,
                 max_open_trades=paper_max_open,
+                cost_pct_per_side=paper_cost_pct_side,
+                fixed_fee_per_side=paper_fixed_fee_side,
+                min_fee_per_side=paper_min_fee_side,
+                max_cost_to_target_pct=paper_max_cost_to_target,
             )
 
         if paper_messages:
-            for msg in paper_messages[:12]:
-                st.info(msg)
+            with st.expander("הודעות הסריקה / עסקאות שנפתחו או דולגו", expanded=True):
+                for msg in paper_messages[:40]:
+                    if "דילוג אחרי עלויות" in msg:
+                        st.warning(msg)
+                    elif "נפתחה עסקת נייר" in msg:
+                        st.success(msg)
+                    else:
+                        st.info(msg)
         else:
             st.warning("לא נפתחו עסקאות נייר חדשות בסריקה הזו.")
 
@@ -3178,23 +3551,34 @@ with tab_paper:
     trades = update_open_paper_trades(trades)
     summary = paper_summary(trades)
 
-    s1, s2, s3, s4 = st.columns(4)
+    s1, s2, s3, s4, s5 = st.columns(5)
     with s1:
         st.metric("עסקאות פתוחות", summary["open_trades"])
     with s2:
         st.metric("עסקאות סגורות", summary["closed_trades"])
     with s3:
-        st.metric("רווח/הפסד כולל", f"${summary['total_pnl']:.2f}")
+        st.metric("רווח ברוטו כולל", f"${summary['total_gross_pnl']:.2f}")
     with s4:
-        st.metric("Win Rate סגור", f"{summary['win_rate']:.1f}%")
+        st.metric("סך עלויות", f"${summary['total_costs']:.2f}")
+    with s5:
+        st.metric("רווח נטו אחרי עלויות", f"${summary['total_net_pnl']:.2f}")
+
+    st.metric("Win Rate סגור לפי נטו", f"{summary['win_rate']:.1f}%")
 
     if trades.empty:
         st.info("עדיין אין עסקאות נייר.")
     else:
+        st.markdown("### סיכום לפי מניה")
+        by_ticker = paper_cost_summary_by_ticker(trades)
+        if by_ticker.empty:
+            st.info("אין עדיין סיכום לפי מניה.")
+        else:
+            st.dataframe(by_ticker, use_container_width=True, hide_index=True)
+
         open_trades = trades[trades["status"].eq("OPEN")].copy()
         closed_trades = trades[trades["status"].eq("CLOSED")].copy()
 
-        st.markdown("### עסקאות פתוחות")
+        st.markdown("### עסקאות פתוחות — כולל עלות ונטו")
         if open_trades.empty:
             st.info("אין עסקאות פתוחות כרגע.")
         else:
@@ -3210,8 +3594,14 @@ with tab_paper:
                         "target_1",
                         "current_price",
                         "quantity",
-                        "pnl",
-                        "pnl_pct",
+                        "notional",
+                        "commission_per_trade",
+                        "gross_pnl",
+                        "total_trade_cost",
+                        "net_pnl",
+                        "net_pnl_pct",
+                        "expected_net_to_target",
+                        "tradeoff_status",
                         "signal_score",
                         "signal_quality",
                     ]
@@ -3220,7 +3610,7 @@ with tab_paper:
                 hide_index=True,
             )
 
-        st.markdown("### עסקאות סגורות")
+        st.markdown("### עסקאות סגורות — ברוטו מול נטו")
         if closed_trades.empty:
             st.info("עדיין אין עסקאות סגורות.")
         else:
@@ -3237,9 +3627,14 @@ with tab_paper:
                         "target_1",
                         "current_price",
                         "quantity",
-                        "pnl",
-                        "pnl_pct",
+                        "notional",
+                        "commission_per_trade",
+                        "gross_pnl",
+                        "total_trade_cost",
+                        "net_pnl",
+                        "net_pnl_pct",
                         "exit_reason",
+                        "cost_to_target_ratio_pct",
                         "signal_score",
                         "signal_quality",
                     ]
