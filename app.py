@@ -108,6 +108,73 @@ DEFAULT_TICKERS = {
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 
+CUSTOM_TICKERS_FILE = DATA_DIR / "custom_tickers.txt"
+
+
+def normalize_ticker(ticker: str) -> str:
+    """
+    Normalize a user-entered ticker.
+    Examples:
+    ' aapl ' -> 'AAPL'
+    'nasdaq:qqq' -> 'QQQ'
+    """
+    if ticker is None:
+        return ""
+    t = str(ticker).strip().upper()
+    if ":" in t:
+        t = t.split(":")[-1].strip()
+    t = t.replace(" ", "")
+    return t
+
+
+def load_custom_tickers() -> list[str]:
+    """
+    Load custom tickers saved by the user.
+    """
+    if not CUSTOM_TICKERS_FILE.exists():
+        return []
+
+    items = []
+    for line in CUSTOM_TICKERS_FILE.read_text(encoding="utf-8", errors="ignore").splitlines():
+        t = normalize_ticker(line)
+        if t:
+            items.append(t)
+
+    return sorted(set(items))
+
+
+def save_custom_ticker(ticker: str) -> bool:
+    """
+    Save a custom ticker to local file.
+    Returns True if added, False if it already existed or invalid.
+    """
+    t = normalize_ticker(ticker)
+    if not t:
+        return False
+
+    existing = set(load_custom_tickers())
+    built_in = set(DEFAULT_TICKERS.values())
+
+    if t in existing or t in built_in:
+        return False
+
+    existing.add(t)
+    CUSTOM_TICKERS_FILE.write_text("\n".join(sorted(existing)) + "\n", encoding="utf-8")
+    return True
+
+
+def get_all_ticker_options() -> dict[str, str]:
+    """
+    Merge default tickers with user-added custom tickers.
+    Keys are display names, values are ticker symbols.
+    """
+    options = dict(DEFAULT_TICKERS)
+    for t in load_custom_tickers():
+        options[f"Custom - {t}"] = t
+    return options
+
+
+
 
 @dataclass
 class AnalyzerConfig:
@@ -1871,6 +1938,110 @@ with tab_live:
 
 
 
+
+def scan_ticker_list_for_now(
+    ticker_options: dict[str, str],
+    cfg: AnalyzerConfig,
+) -> pd.DataFrame:
+    """
+    Scan all tickers in the current list and rank current educational scenarios.
+    """
+    rows = []
+
+    for display_name, ticker in list(ticker_options.items()):
+        try:
+            df = fetch_intraday_yfinance(
+                ticker=ticker,
+                days_back=cfg.days_back,
+                interval_minutes=cfg.bar_minutes,
+            )
+            latest_day_df = get_latest_trading_day(df)
+
+            if latest_day_df.empty:
+                rows.append({
+                    "name": display_name,
+                    "ticker": ticker,
+                    "direction": "אין נתונים",
+                    "bias": "NO_DATA",
+                    "score": 0,
+                    "quality": "N/A",
+                    "current_price": np.nan,
+                    "change_from_open_pct": np.nan,
+                    "rsi14": np.nan,
+                    "relative_volume": np.nan,
+                    "entry_zone": "",
+                    "trigger": "",
+                    "stop": "",
+                    "target_1": "",
+                    "target_2": "",
+                    "reason": "לא נמצאו נתונים זמינים.",
+                })
+                continue
+
+            plan = build_invest_now_plan(latest_day_df, cfg)
+
+            rows.append({
+                "name": display_name,
+                "ticker": ticker,
+                "direction": plan.get("direction_he", ""),
+                "bias": plan.get("bias", ""),
+                "score": plan.get("setup_score", 0),
+                "quality": plan.get("setup_quality", ""),
+                "current_price": plan.get("current_price", np.nan),
+                "change_from_open_pct": plan.get("current_move_pct", np.nan),
+                "rsi14": plan.get("rsi14", np.nan),
+                "relative_volume": plan.get("relative_volume", np.nan),
+                "entry_zone": plan.get("entry_zone", ""),
+                "trigger": plan.get("trigger", ""),
+                "stop": plan.get("stop", ""),
+                "target_1": plan.get("target_1", ""),
+                "target_2": plan.get("target_2", ""),
+                "reason": plan.get("reason", ""),
+            })
+
+            time.sleep(0.25)
+
+        except Exception as e:
+            rows.append({
+                "name": display_name,
+                "ticker": ticker,
+                "direction": "שגיאה",
+                "bias": "ERROR",
+                "score": 0,
+                "quality": "N/A",
+                "current_price": np.nan,
+                "change_from_open_pct": np.nan,
+                "rsi14": np.nan,
+                "relative_volume": np.nan,
+                "entry_zone": "",
+                "trigger": "",
+                "stop": "",
+                "target_1": "",
+                "target_2": "",
+                "reason": str(e)[:200],
+            })
+
+    if not rows:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(rows)
+
+    def rank_bias(row):
+        bias = row.get("bias", "")
+        score = abs(float(row.get("score", 0) or 0))
+        if bias in ["LONG_WATCH", "SHORT_WATCH"]:
+            return 100 + score
+        if bias == "NO_TRADE":
+            return 10 + score
+        return 0
+
+    out["rank"] = out.apply(rank_bias, axis=1)
+    out = out.sort_values(["rank", "score"], ascending=[False, False])
+    out = out.drop(columns=["rank"])
+
+    return out
+
+
 # ============================================================
 # Invest now tab
 # ============================================================
@@ -1893,15 +2064,40 @@ with tab_invest_now:
     col_now_1, col_now_2 = st.columns([1, 2])
 
     with col_now_1:
+        ticker_options_now = get_all_ticker_options()
+
+        new_ticker_input = st.text_input(
+            "הוסף סימול מניה לרשימה",
+            placeholder="לדוגמה: PLTR / SMCI / MSTR / QQQ",
+            key="new_ticker_input",
+        )
+
+        add_ticker_clicked = st.button("➕ הוסף לרשימה", use_container_width=True)
+
+        if add_ticker_clicked:
+            cleaned_ticker = normalize_ticker(new_ticker_input)
+            if not cleaned_ticker:
+                st.warning("לא הוקלד סימול.")
+            else:
+                added = save_custom_ticker(cleaned_ticker)
+                if added:
+                    st.success(f"{cleaned_ticker} נוסף לרשימה.")
+                    st.rerun()
+                else:
+                    st.info(f"{cleaned_ticker} כבר קיים ברשימה או לא תקין.")
+
+        ticker_options_now = get_all_ticker_options()
+
         now_name = st.selectbox(
             "בחר מניה / ETF לניתוח עכשיו",
-            options=list(DEFAULT_TICKERS.keys()),
+            options=list(ticker_options_now.keys()),
             index=0,
             key="invest_now_selectbox",
         )
-        now_ticker = DEFAULT_TICKERS[now_name]
+        now_ticker = ticker_options_now[now_name]
 
         now_refresh = st.button("🔄 נתח עכשיו", use_container_width=True)
+        scan_now_list = st.button("📋 סרוק את כל הרשימה ומצא הזדמנויות", use_container_width=True)
         now_auto_refresh = st.checkbox("רענון אוטומטי כל 60 שניות", value=False, key="invest_now_auto")
 
     with col_now_2:
@@ -1912,6 +2108,7 @@ with tab_invest_now:
 <p>
 המערכת תבדוק את הנתונים האחרונים הזמינים ותייצר תרחיש לימודי:
 לונג / שורט / המתנה, אזור כניסה, טריגר, סטופ ויעדים.
+אפשר גם להוסיף סימול מניה ידנית ולסרוק את כל הרשימה.
 </p>
 <p class="small-muted">
 ב־yfinance הנתונים לא בהכרח בזמן אמת מלא ויכולים להיות מושהים.
@@ -1920,6 +2117,66 @@ with tab_invest_now:
 """,
             unsafe_allow_html=True,
         )
+
+    if scan_now_list:
+        with st.spinner("סורק את כל הרשימה ומחפש לונג/שורט אפשריים עכשיו..."):
+            scan_results = scan_ticker_list_for_now(
+                ticker_options=get_all_ticker_options(),
+                cfg=cfg,
+            )
+
+        if scan_results.empty:
+            st.warning("לא נמצאו תוצאות לסריקה.")
+        else:
+            opportunities = scan_results[scan_results["bias"].isin(["LONG_WATCH", "SHORT_WATCH"])].copy()
+            wait_list = scan_results[scan_results["bias"].eq("NO_TRADE")].copy()
+
+            st.markdown("### מניות / ETF שיש להן תרחיש לונג או שורט עכשיו")
+
+            if opportunities.empty:
+                st.warning("כרגע אין מניות עם תרחיש לונג/שורט מספיק נקי לפי הפילטרים.")
+            else:
+                st.dataframe(
+                    opportunities[
+                        [
+                            "ticker",
+                            "direction",
+                            "score",
+                            "quality",
+                            "current_price",
+                            "change_from_open_pct",
+                            "rsi14",
+                            "relative_volume",
+                            "entry_zone",
+                            "trigger",
+                            "stop",
+                            "target_1",
+                            "target_2",
+                        ]
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+            with st.expander("הצג גם מניות שכרגע עדיף להמתין בהן"):
+                st.dataframe(
+                    wait_list[
+                        [
+                            "ticker",
+                            "direction",
+                            "score",
+                            "quality",
+                            "current_price",
+                            "change_from_open_pct",
+                            "reason",
+                        ]
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+            with st.expander("כל תוצאות הסריקה"):
+                st.dataframe(scan_results, use_container_width=True, hide_index=True)
 
     if now_refresh or now_auto_refresh:
         try:
