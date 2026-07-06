@@ -2364,6 +2364,11 @@ with tab_invest_now:
 
         now_refresh = st.button("🔄 נתח עכשיו", use_container_width=True)
         scan_now_list = st.button("📋 סרוק את כל הרשימה ומצא הזדמנויות", use_container_width=True)
+        scan_auto_refresh = st.checkbox(
+            "סריקה אוטומטית של כל הרשימה כל 30 שניות",
+            value=False,
+            key="scan_auto_refresh_30s",
+        )
         now_auto_refresh = st.checkbox("רענון אוטומטי כל 20 שניות", value=False, key="invest_now_auto")
 
     with col_now_2:
@@ -2374,7 +2379,7 @@ with tab_invest_now:
 <p>
 המערכת תבדוק את הנתונים האחרונים הזמינים ותייצר תרחיש לימודי:
 לונג / שורט / המתנה, אזור כניסה, טריגר, סטופ ויעדים.
-אפשר גם להוסיף סימול מניה ידנית ולסרוק את כל הרשימה.
+אפשר גם להוסיף סימול מניה ידנית, לסרוק את כל הרשימה, ולהפעיל סריקה אוטומטית כל 30 שניות.
 </p>
 <p class="small-muted">
 ב־yfinance הנתונים לא בהכרח בזמן אמת מלא ויכולים להיות מושהים.
@@ -2384,7 +2389,7 @@ with tab_invest_now:
             unsafe_allow_html=True,
         )
 
-    if scan_now_list:
+    if scan_now_list or scan_auto_refresh:
         with st.spinner("סורק את כל הרשימה ומחפש לונג/שורט אפשריים עכשיו..."):
             scan_results = scan_ticker_list_for_now(
                 ticker_options=get_all_ticker_options(),
@@ -2449,6 +2454,10 @@ with tab_invest_now:
 
             with st.expander("כל תוצאות הסריקה"):
                 st.dataframe(scan_results, use_container_width=True, hide_index=True)
+
+        if scan_auto_refresh:
+            time.sleep(30)
+            st.rerun()
 
     if now_refresh or now_auto_refresh:
         try:
