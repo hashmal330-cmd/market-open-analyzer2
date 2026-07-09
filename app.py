@@ -15,7 +15,7 @@ import plotly.graph_objects as go
 # App setup
 # ============================================================
 
-st.set_page_config(page_title="Paper Trading Lab V4", page_icon="🧪", layout="wide")
+st.set_page_config(page_title="Paper Trading Lab V5", page_icon="🧪", layout="wide")
 
 DATA_DIR = Path("paper_data")
 DATA_DIR.mkdir(exist_ok=True)
@@ -26,6 +26,7 @@ COSTS_FILE = DATA_DIR / "costs_v3.json"
 UNITS_FILE = DATA_DIR / "units_v3.json"
 RULES_FILE = DATA_DIR / "rules_v3.json"
 ACCOUNT_FILE = DATA_DIR / "account_v3.json"
+PENDING_FILE = DATA_DIR / "pending_signals_v5.csv"
 
 NY_TZ = "America/New_York"
 
@@ -70,6 +71,10 @@ DEFAULT_RULES = {
     "max_allowed_loss_per_trade_dollars": 20.0,
     "exit_if_profitable_trade_turns_red": True,
     "exit_on_target_when_score_below": 7,
+    "profit_giveback_pct": 10.0,
+    "min_net_profit_for_giveback": 5.0,
+    "confirm_before_entry_seconds": 60,
+    "pending_signal_expire_minutes": 6,
 }
 
 DEFAULT_ACCOUNT = {
@@ -93,6 +98,12 @@ TRADE_COLUMNS = [
     "cost_pct_per_side", "fixed_fee_per_side", "min_fee_per_side", "max_cost_to_target_pct",
     "base_unit_dollars", "unit_multiplier",
     "created_settings_snapshot",
+]
+
+PENDING_COLUMNS = [
+    "pending_id", "created_at", "ticker", "mode", "side", "score",
+    "entry_price", "stop_loss", "target_reference", "reason",
+    "status", "last_checked_at", "message",
 ]
 
 
@@ -248,6 +259,7 @@ def exit_reason_he(reason):
         "MAX_LOSS_LIMIT": "הפסד הגיע למגבלת ההפסד לעסקה",
         "MANUAL_CLOSE": "סגירה ידנית",
         "CYCLE_TARGET_50": "מחזור רווח הושלם: נסגר בגלל יעד רווח נטו",
+        "PROFIT_GIVEBACK": "הרווח ירד באחוז שהוגדר מהרווח המקסימלי",
     }
     return mapping.get(str(reason), str(reason or ""))
 
@@ -279,6 +291,153 @@ def save_trades(df):
 
 def clear_trades():
     save_trades(empty_trades())
+
+
+def empty_pending():
+    return pd.DataFrame(columns=PENDING_COLUMNS)
+
+
+def load_pending():
+    if not PENDING_FILE.exists() or PENDING_FILE.stat().st_size == 0:
+        return empty_pending()
+    try:
+        df = pd.read_csv(PENDING_FILE)
+    except Exception:
+        return empty_pending()
+    for col in PENDING_COLUMNS:
+        if col not in df.columns:
+            df[col] = np.nan
+    return df[PENDING_COLUMNS]
+
+
+def save_pending(df):
+    if df is None or df.empty:
+        empty_pending().to_csv(PENDING_FILE, index=False)
+        return
+    for col in PENDING_COLUMNS:
+        if col not in df.columns:
+            df[col] = np.nan
+    df[PENDING_COLUMNS].to_csv(PENDING_FILE, index=False)
+
+
+def clear_pending():
+    save_pending(empty_pending())
+
+
+def has_pending_signal(ticker, mode):
+    pending = load_pending()
+    if pending.empty:
+        return False
+    return bool((pending["status"].astype(str).eq("PENDING") & pending["ticker"].astype(str).eq(str(ticker)) & pending["mode"].astype(str).eq(str(mode))).any())
+
+
+def add_pending_signal(signal):
+    pending = load_pending()
+    ticker = normalize_ticker(signal["ticker"])
+    mode = str(signal["mode"])
+    trades = load_trades()
+    if has_open_trade(trades, ticker, mode):
+        return False, f"{ticker}: כבר יש עסקה פתוחה ב־{mode}."
+    if has_pending_signal(ticker, mode):
+        return False, f"{ticker}: כבר יש מועמדת בהמתנה לבדיקה."
+
+    row = {
+        "pending_id": str(uuid.uuid4()),
+        "created_at": now_ny_iso(),
+        "ticker": ticker,
+        "mode": mode,
+        "side": str(signal["signal"]),
+        "score": int(signal.get("score", 0)),
+        "entry_price": float(signal.get("entry", np.nan)),
+        "stop_loss": float(signal.get("stop", np.nan)),
+        "target_reference": float(signal.get("target", np.nan)),
+        "reason": str(signal.get("reason", "")),
+        "status": "PENDING",
+        "last_checked_at": "",
+        "message": "נמצאה עסקה משתלמת. מחכים לאישור חוזר לפני כניסה.",
+    }
+    pending = pd.concat([pending, pd.DataFrame([row])], ignore_index=True)
+    save_pending(pending)
+    return True, f"{ticker}: נשמרה מועמדת ל־{mode}. נבדוק שוב בעוד דקה לפני כניסה."
+
+
+def process_pending_signals(min_score, max_new_override=None, max_open_override=None):
+    pending = load_pending()
+    messages = []
+    if pending.empty:
+        return messages
+
+    rules = load_rules()
+    trades = load_trades()
+    max_new = int(max_new_override) if max_new_override is not None else int(rules["max_new_trades_per_scan"])
+    max_open = int(max_open_override) if max_open_override is not None else int(rules.get("max_open_trades", 6))
+    current_open = 0 if trades.empty else int(trades["status"].eq("OPEN").sum())
+    available_slots = max(0, max_open - current_open)
+    max_to_open = min(max_new, available_slots)
+
+    confirm_seconds = float(rules.get("confirm_before_entry_seconds", 60))
+    expire_minutes = float(rules.get("pending_signal_expire_minutes", 6))
+    opened = 0
+
+    for idx in pending.index[pending["status"].astype(str).eq("PENDING")].tolist():
+        if opened >= max_to_open:
+            break
+        created_at = timestamp_to_ny(pending.loc[idx, "created_at"])
+        if created_at is None:
+            pending.loc[idx, "status"] = "REJECTED"
+            pending.loc[idx, "message"] = "זמן יצירה לא תקין."
+            continue
+
+        age_seconds = (now_ny() - created_at).total_seconds()
+        pending.loc[idx, "last_checked_at"] = now_ny_iso()
+
+        if age_seconds > expire_minutes * 60:
+            pending.loc[idx, "status"] = "EXPIRED"
+            pending.loc[idx, "message"] = "המועמדת פגה כי עבר יותר מדי זמן."
+            messages.append(f"{pending.loc[idx, 'ticker']}: מועמדת פגה.")
+            continue
+        if age_seconds < confirm_seconds:
+            remaining = int(confirm_seconds - age_seconds)
+            pending.loc[idx, "message"] = f"בהמתנה לאישור חוזר. נשארו בערך {remaining} שניות."
+            continue
+
+        ticker = str(pending.loc[idx, "ticker"])
+        mode = str(pending.loc[idx, "mode"])
+        original_side = str(pending.loc[idx, "side"])
+        original_score = int(safe_float(pending.loc[idx, "score"], 0))
+
+        try:
+            new_signal = make_signal(ticker, mode)
+        except Exception as e:
+            pending.loc[idx, "message"] = f"שגיאה בבדיקה חוזרת: {str(e)[:100]}"
+            continue
+
+        new_side = str(new_signal.get("signal", "WAIT"))
+        new_score = int(new_signal.get("score", 0))
+        if new_side != original_side:
+            pending.loc[idx, "status"] = "REJECTED"
+            pending.loc[idx, "message"] = f"נדחה: הכיוון השתנה מ־{original_side} ל־{new_side}."
+            messages.append(f"{ticker}: לא נכנסנו — הכיוון השתנה אחרי דקה.")
+            continue
+        if new_score < int(min_score):
+            pending.loc[idx, "status"] = "REJECTED"
+            pending.loc[idx, "message"] = f"נדחה: הניקוד ירד מ־{original_score} ל־{new_score}."
+            messages.append(f"{ticker}: לא נכנסנו — הניקוד ירד אחרי דקה.")
+            continue
+
+        ok, msg = open_trade(new_signal, min_score=min_score)
+        if ok:
+            opened += 1
+            pending.loc[idx, "status"] = "OPENED"
+            pending.loc[idx, "message"] = "נפתחה עסקה אחרי אישור חוזר של דקה."
+            messages.append(f"{msg} | נפתחה אחרי בדיקה חוזרת של דקה.")
+        else:
+            pending.loc[idx, "status"] = "REJECTED"
+            pending.loc[idx, "message"] = msg
+            messages.append(f"{ticker}: לא נפתחה אחרי דקה — {msg}")
+
+    save_pending(pending)
+    return messages
 
 
 # ============================================================
@@ -948,6 +1107,23 @@ def manage_trade(row, df_after_entry):
     current_net = current_pnl["net_pnl"]
     res["max_net_pnl_seen"] = max(current_max_net_seen, current_net)
 
+    # יציאה לפי ירידה מהרווח המקסימלי.
+    # דוגמה: שיא רווח 20$, ירידה מוגדרת 10% => יוצאים אם ירד ל־18$ או פחות.
+    giveback_pct = float(rules.get("profit_giveback_pct", 10.0))
+    min_profit_for_giveback = float(rules.get("min_net_profit_for_giveback", 5.0))
+    peak_profit = float(res["max_net_pnl_seen"])
+    if peak_profit >= min_profit_for_giveback:
+        allowed_drop = peak_profit * (giveback_pct / 100.0)
+        if current_net <= peak_profit - allowed_drop:
+            res["exit"] = True
+            res["exit_reason"] = "PROFIT_GIVEBACK"
+            res["action"] = "EXIT_PROFIT_GIVEBACK"
+            res["reason"] = (
+                f"הרווח ירד ב־{giveback_pct:.1f}% או יותר מהרווח המקסימלי. "
+                f"שיא רווח נטו: ${peak_profit:.2f}, רווח נוכחי: ${current_net:.2f}."
+            )
+            return res
+
     base_risk = abs(entry - initial_stop)
     if base_risk <= 0:
         base_risk = max(entry * 0.001, abs(entry - stop))
@@ -1259,7 +1435,7 @@ def close_trade_manually(trade_id):
 
 
 def scan_and_open(tickers, modes, min_score, max_new_override=None, max_open_override=None):
-    """Scan all candidates, then open the best ones by score and expected move."""
+    """Scan candidates, save the best ones as pending, and enter only after a 1-minute re-check."""
     messages = []
     rules = load_rules()
     trades = load_trades()
@@ -1268,11 +1444,13 @@ def scan_and_open(tickers, modes, min_score, max_new_override=None, max_open_ove
     max_open = int(max_open_override) if max_open_override is not None else int(rules.get("max_open_trades", 6))
 
     current_open = 0 if trades.empty else int(trades["status"].eq("OPEN").sum())
-    available_slots = max(0, max_open - current_open)
+    active_pending = load_pending()
+    pending_count = 0 if active_pending.empty else int(active_pending["status"].astype(str).eq("PENDING").sum())
+    available_slots = max(0, max_open - current_open - pending_count)
     if available_slots <= 0:
-        return [f"לא נפתחו עסקאות: יש כבר {current_open} עסקאות פתוחות, והמקסימום הוא {max_open}."]
+        return [f"לא נוספו מועמדות: יש {current_open} עסקאות פתוחות ו־{pending_count} מועמדות. המקסימום הוא {max_open}."]
 
-    max_to_open = min(max_new, available_slots)
+    max_to_save = min(max_new, available_slots)
     candidates = []
 
     for ticker in tickers:
@@ -1293,22 +1471,19 @@ def scan_and_open(tickers, modes, min_score, max_new_override=None, max_open_ove
         return messages + ["לא נמצאו עסקאות עם ניקוד מספיק גבוה."]
 
     candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
-    opened = 0
-
+    saved = 0
     for _, _, sig in candidates:
-        if opened >= max_to_open:
+        if saved >= max_to_save:
             break
-        ok, msg = open_trade(sig, min_score)
+        ok, msg = add_pending_signal(sig)
         if ok:
-            opened += 1
-            messages.append(msg)
-        elif "לא משתלם" in msg or "Cooldown" in msg or "כבר יש עסקה" in msg:
-            messages.append(msg)
+            saved += 1
+        messages.append(msg)
 
-    if opened == 0:
-        messages.append("נסרקו איתותים, אבל לא נפתחה עסקה בגלל עלויות / cooldown / עסקאות קיימות.")
+    if saved == 0:
+        messages.append("נסרקו איתותים, אבל לא נשמרה מועמדת חדשה בגלל עסקאות/מועמדות קיימות.")
     else:
-        messages.append(f"נפתחו {opened} עסקאות חדשות מתוך מקסימום {max_to_open}.")
+        messages.append(f"נשמרו {saved} מועמדות. הן ייבדקו שוב אחרי דקה ורק אז ייפתחו.")
 
     return messages
 
@@ -1494,7 +1669,7 @@ def render_closed_trades(closed_trades):
 st.markdown(
     """
 <div class="title-box">
-<h1>🧪 Paper Trading Lab V4</h1>
+<h1>🧪 Paper Trading Lab V5</h1>
 <p>אפליקציית Paper Trading נקייה: יעד מחזור 50$, סטופ ידני, סיבות יציאה, Break-even אחרי עלויות וצמצום הפסדים.</p>
 </div>
 """,
@@ -1515,6 +1690,8 @@ with tab_paper:
     st.markdown("<div class='card warn'><strong>בדמו בלבד:</strong> אין חיבור לברוקר ואין כסף אמיתי.</div>", unsafe_allow_html=True)
 
     trades, update_msgs = update_open_trades()
+    pending_msgs = process_pending_signals(min_score=4)
+    update_msgs.extend(pending_msgs)
     trades = load_trades()
 
     render_summary(trades)
@@ -1555,6 +1732,11 @@ with tab_paper:
         st.success("נוקה.")
         st.rerun()
 
+    if clear_pending_btn:
+        clear_pending()
+        st.success("המועמדות בהמתנה נוקו.")
+        st.rerun()
+
     if update_now:
         trades, msgs = update_open_trades()
         for msg in msgs:
@@ -1567,7 +1749,8 @@ with tab_paper:
             st.warning("בחר מניות וסוג השקעה.")
         else:
             with st.spinner("סורק, בודק ניקוד, עלויות ו־cooldown..."):
-                msgs = scan_and_open(selected_tickers, modes, min_score, max_new_override=max_new_now, max_open_override=max_open_now)
+                msgs = process_pending_signals(min_score, max_new_override=max_new_now, max_open_override=max_open_now)
+                msgs += scan_and_open(selected_tickers, modes, min_score, max_new_override=max_new_now, max_open_override=max_open_now)
                 trades, _ = update_open_trades()
 
             if msgs:
@@ -1583,6 +1766,13 @@ with tab_paper:
     trades = load_trades()
     open_trades = trades[trades["status"].eq("OPEN")].copy() if not trades.empty else empty_trades()
     closed_trades = trades[trades["status"].eq("CLOSED")].copy() if not trades.empty else empty_trades()
+
+    pending = load_pending()
+    active_pending = pending[pending["status"].astype(str).eq("PENDING")].copy() if not pending.empty else empty_pending()
+    if not active_pending.empty:
+        st.markdown("### מועמדות בהמתנה לאישור דקה")
+        show_cols = ["ticker", "mode", "side", "score", "entry_price", "status", "message", "created_at"]
+        st.dataframe(active_pending[show_cols], use_container_width=True, hide_index=True)
 
     render_open_trades(open_trades)
     render_closed_trades(closed_trades)
@@ -1675,6 +1865,10 @@ with tab_rules:
         breakeven_after = st.number_input("כמה רווח נטו צריך לפני הגנת איזון ($)", 0.0, 500.0, float(rules["breakeven_after_profit_dollars"]), 1.0)
         lock_profit_after = st.number_input("כמה רווח נטו צריך לפני הידוק אגרסיבי ($)", 0.0, 1000.0, float(rules["lock_profit_after_net_dollars"]), 1.0)
         max_loss = st.number_input("מקסימום הפסד נטו לעסקה ($)", 1.0, 10000.0, float(rules["max_allowed_loss_per_trade_dollars"]), 1.0)
+        giveback_pct = st.number_input("יציאה אם ירד X% מהרווח המקסימלי", 1.0, 90.0, float(rules.get("profit_giveback_pct", 10.0)), 1.0)
+        min_giveback_profit = st.number_input("מינימום רווח נטו להפעלת ירידת רווח ($)", 0.0, 1000.0, float(rules.get("min_net_profit_for_giveback", 5.0)), 1.0)
+        confirm_seconds = st.number_input("כמה שניות לחכות לפני כניסה אחרי זיהוי עסקה", 10, 600, int(rules.get("confirm_before_entry_seconds", 60)))
+        pending_expire = st.number_input("אחרי כמה דקות מועמדת פגה", 1, 60, int(rules.get("pending_signal_expire_minutes", 6)))
         exit_score_below = st.slider("לצאת ביעד אם ניקוד נמוך מ־", 1, 9, int(rules["exit_on_target_when_score_below"]))
 
     exit_turn_red = st.checkbox(
@@ -1708,6 +1902,10 @@ with tab_rules:
             "max_allowed_loss_per_trade_dollars": float(max_loss),
             "exit_if_profitable_trade_turns_red": bool(exit_turn_red),
             "exit_on_target_when_score_below": int(exit_score_below),
+            "profit_giveback_pct": float(giveback_pct),
+            "min_net_profit_for_giveback": float(min_giveback_profit),
+            "confirm_before_entry_seconds": int(confirm_seconds),
+            "pending_signal_expire_minutes": int(pending_expire),
         })
         st.success("נשמר.")
 
@@ -1779,7 +1977,7 @@ with tab_help:
 - ווליום
 - מבנה נרות
 
-### מה נוסף ב־V4?
+### מה נוסף ב־V5?
 
 **זמן יציאה ומשך עסקה**  
 בכל עסקה סגורה מופיע זמן יציאה וגם משך העסקה בדקות.

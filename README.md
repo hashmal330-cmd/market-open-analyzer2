@@ -1,3 +1,3 @@
-# Paper Trading Lab V4
+# Paper Trading Lab V5
 
-Clean paper-trading-only app with chart-based TP/SL, manual close fix, live charts, and trade count controls. Educational / demo only. Not investment advice.
+Paper-trading-only app with one-minute entry confirmation and profit giveback exit. Educational / demo only. Not investment advice.
