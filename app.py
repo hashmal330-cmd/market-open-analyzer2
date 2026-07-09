@@ -8,13 +8,14 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
+import plotly.graph_objects as go
 
 
 # ============================================================
 # App setup
 # ============================================================
 
-st.set_page_config(page_title="Paper Trading Lab V3", page_icon="🧪", layout="wide")
+st.set_page_config(page_title="Paper Trading Lab V4", page_icon="🧪", layout="wide")
 
 DATA_DIR = Path("paper_data")
 DATA_DIR.mkdir(exist_ok=True)
@@ -58,6 +59,7 @@ DEFAULT_RULES = {
     "min_hold_half_hour_minutes": 10,
     "cooldown_after_close_minutes": 8,
     "max_new_trades_per_scan": 3,
+    "max_open_trades": 6,
 
     # Profit-taking and protection
     "cycle_net_profit_target": 50.0,
@@ -471,6 +473,136 @@ def breakeven_after_costs(row):
 
 
 
+
+# ============================================================
+# Chart-based stop / target logic
+# ============================================================
+
+def linear_slope_per_bar(series: pd.Series, lookback: int = 8) -> float:
+    """Approximate price slope per 1-minute bar using linear regression."""
+    s = pd.Series(series).dropna().tail(max(3, int(lookback)))
+    if len(s) < 3:
+        return 0.0
+    x = np.arange(len(s), dtype=float)
+    y = s.astype(float).values
+    try:
+        return float(np.polyfit(x, y, 1)[0])
+    except Exception:
+        return 0.0
+
+
+def recent_swing_levels(d: pd.DataFrame, lookback: int = 12) -> dict:
+    """Recent support/resistance based on last candles."""
+    recent = d.tail(max(5, int(lookback)))
+    return {
+        "support": safe_float(recent["low"].min(), safe_float(d.iloc[-1]["close"])),
+        "resistance": safe_float(recent["high"].max(), safe_float(d.iloc[-1]["close"])),
+        "last_low": safe_float(recent["low"].iloc[-1], safe_float(d.iloc[-1]["close"])),
+        "last_high": safe_float(recent["high"].iloc[-1], safe_float(d.iloc[-1]["close"])),
+    }
+
+
+def chart_based_stop_target(d: pd.DataFrame, side: str, mode: str) -> dict:
+    """
+    Stop/TP calculated from the chart:
+    - Stop: recent swing low/high plus buffer, not a random number.
+    - TP: slope projection discounted by 20%, with a minimum RR check.
+    """
+    d = d.dropna(subset=["close"]).copy()
+    if d.empty:
+        return {"stop": np.nan, "target": np.nan, "reason": "אין נתוני גרף"}
+
+    last = d.iloc[-1]
+    entry = safe_float(last["close"])
+
+    if mode == "מהירה":
+        lookback = 10
+        projection_bars = 5
+        min_rr = 1.10
+        atr_col = "atr3"
+    else:
+        lookback = 30
+        projection_bars = 30
+        min_rr = 1.35
+        atr_col = "atr14"
+
+    levels = recent_swing_levels(d, lookback=lookback)
+    atr = safe_float(last.get(atr_col), entry * 0.0015)
+    atr = max(atr, entry * 0.0008)
+    buffer = max(atr * 0.25, entry * 0.00025)
+
+    slope = linear_slope_per_bar(d["close"], lookback=min(lookback, 14))
+    discounted_move = abs(slope) * projection_bars * 0.80  # 20% reduction from slope projection
+    min_move = atr * (1.0 if mode == "מהירה" else 1.5)
+    projected_move = max(discounted_move, min_move)
+
+    if side == "LONG":
+        stop = min(levels["support"], levels["last_low"]) - buffer
+        risk = max(entry - stop, atr * 0.65)
+        stop = entry - risk
+        target_from_slope = entry + projected_move
+        target_from_rr = entry + risk * min_rr
+        target = max(target_from_slope, target_from_rr)
+        reason = (
+            f"סטופ לפי swing low/support פחות buffer. "
+            f"TP לפי שיפוע {slope:.4f} ל־{projection_bars} נרות עם הורדת 20%, "
+            f"ובדיקת מינימום RR {min_rr:.2f}."
+        )
+    else:
+        stop = max(levels["resistance"], levels["last_high"]) + buffer
+        risk = max(stop - entry, atr * 0.65)
+        stop = entry + risk
+        target_from_slope = entry - projected_move
+        target_from_rr = entry - risk * min_rr
+        target = min(target_from_slope, target_from_rr)
+        reason = (
+            f"סטופ לפי swing high/resistance פלוס buffer. "
+            f"TP לפי שיפוע {slope:.4f} ל־{projection_bars} נרות עם הורדת 20%, "
+            f"ובדיקת מינימום RR {min_rr:.2f}."
+        )
+
+    return {"stop": float(stop), "target": float(target), "slope": float(slope), "projection_bars": int(projection_bars), "reason": reason}
+
+
+def make_live_trade_chart(ticker: str, row=None):
+    """Render only on demand so the app stays responsive."""
+    df = latest_session(fetch_1m(ticker))
+    if df.empty:
+        return None
+
+    d = add_indicators(df).tail(120).copy()
+    if d.empty:
+        return None
+
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(x=d.index, open=d["open"], high=d["high"], low=d["low"], close=d["close"], name="נרות 1 דקה"))
+
+    for col, label in [("ema3", "EMA3"), ("ema5", "EMA5"), ("ema9", "EMA9"), ("ema21", "EMA21"), ("vwap", "VWAP")]:
+        if col in d.columns:
+            fig.add_trace(go.Scatter(x=d.index, y=d[col], mode="lines", name=label))
+
+    if row is not None:
+        x0, x1 = d.index[0], d.index[-1]
+        lines = [
+            (safe_float(row.get("entry_price"), np.nan), "כניסה", "dash"),
+            (safe_float(row.get("stop_loss"), np.nan), "סטופ", "dot"),
+            (safe_float(row.get("target_reference"), np.nan), "TP/יעד", "dashdot"),
+            (safe_float(row.get("profit_stop"), np.nan), "סטופ רווח", "longdash"),
+        ]
+        for value, name, dash in lines:
+            if np.isfinite(value):
+                fig.add_trace(go.Scatter(x=[x0, x1], y=[value, value], mode="lines", name=name, line=dict(dash=dash)))
+
+    fig.update_layout(
+        title=f"{ticker} — גרף חי 1 דקה",
+        height=520,
+        xaxis_rangeslider_visible=False,
+        margin=dict(l=10, r=10, t=50, b=10),
+        legend=dict(orientation="h"),
+    )
+    return fig
+
+
 # ============================================================
 # Signal logic
 # ============================================================
@@ -586,14 +718,14 @@ def make_signal(ticker, mode):
 
     if ls >= ss and ls >= 3:
         side, score, reasons = "LONG", ls, lr
-        stop = entry - stop_mult * atr
-        target = entry + target_mult * atr
     elif ss > ls and ss >= 3:
         side, score, reasons = "SHORT", ss, sr
-        stop = entry + stop_mult * atr
-        target = entry - target_mult * atr
     else:
         return {"signal": "WAIT", "ticker": ticker, "mode": mode, "score": max(ls, ss), "reason": f"לונג {ls}, שורט {ss} — אין יתרון ברור"}
+
+    chart_plan = chart_based_stop_target(d, side, mode)
+    stop = chart_plan["stop"]
+    target = chart_plan["target"]
 
     return {
         "signal": side,
@@ -603,7 +735,7 @@ def make_signal(ticker, mode):
         "entry": float(entry),
         "stop": float(stop),
         "target": float(target),
-        "reason": " | ".join(reasons),
+        "reason": " | ".join(reasons + [chart_plan["reason"]]),
     }
 
 
@@ -1109,6 +1241,7 @@ def update_open_trades():
     return trades, messages
 
 def close_trade_manually(trade_id):
+    """Manual close should be instant and stable: no yfinance call while clicking."""
     trades = load_trades()
     mask = trades["trade_id"].astype(str).eq(str(trade_id)) & trades["status"].eq("OPEN")
     if trades.empty or not mask.any():
@@ -1116,42 +1249,66 @@ def close_trade_manually(trade_id):
 
     idx = trades.index[mask][0]
     ticker = str(trades.loc[idx, "ticker"])
-
-    try:
-        df = latest_session(fetch_1m(ticker))
-        current = safe_float(df.iloc[-1]["close"]) if not df.empty else safe_float(trades.loc[idx, "current_price"])
-    except Exception:
-        current = safe_float(trades.loc[idx, "current_price"])
+    current = safe_float(trades.loc[idx, "current_price"], safe_float(trades.loc[idx, "entry_price"]))
 
     trades, pnl = close_trade_at_index(trades, idx, current, "MANUAL_CLOSE")
     trades.loc[idx, "management_action"] = "MANUAL_CLOSE"
-    trades.loc[idx, "management_reason"] = "נסגר ידנית על ידי המשתמש."
+    trades.loc[idx, "management_reason"] = "נסגר ידנית על ידי המשתמש לפי המחיר האחרון הידוע באפליקציה."
     save_trades(trades)
     return True, f"{ticker}: נסגר ידנית במחיר {current:.2f}. נטו ${pnl['net_pnl']:.2f}"
 
 
-def scan_and_open(tickers, modes, min_score):
+def scan_and_open(tickers, modes, min_score, max_new_override=None, max_open_override=None):
+    """Scan all candidates, then open the best ones by score and expected move."""
     messages = []
-    opened = 0
-    max_new = int(load_rules()["max_new_trades_per_scan"])
+    rules = load_rules()
+    trades = load_trades()
+
+    max_new = int(max_new_override) if max_new_override is not None else int(rules["max_new_trades_per_scan"])
+    max_open = int(max_open_override) if max_open_override is not None else int(rules.get("max_open_trades", 6))
+
+    current_open = 0 if trades.empty else int(trades["status"].eq("OPEN").sum())
+    available_slots = max(0, max_open - current_open)
+    if available_slots <= 0:
+        return [f"לא נפתחו עסקאות: יש כבר {current_open} עסקאות פתוחות, והמקסימום הוא {max_open}."]
+
+    max_to_open = min(max_new, available_slots)
+    candidates = []
 
     for ticker in tickers:
         for mode in modes:
-            if opened >= max_new:
-                messages.append(f"הגעת למקסימום עסקאות חדשות בסריקה: {max_new}.")
-                return messages
-
             try:
                 sig = make_signal(ticker, mode)
-                ok, msg = open_trade(sig, min_score)
-                if ok:
-                    opened += 1
-                    messages.append(msg)
-                elif "לא משתלם" in msg or "Cooldown" in msg:
-                    messages.append(msg)
+                if sig.get("signal") not in ["LONG", "SHORT"]:
+                    continue
+                if int(sig.get("score", 0)) < int(min_score):
+                    continue
+                expected_move = abs(float(sig["target"]) - float(sig["entry"]))
+                candidates.append((int(sig["score"]), expected_move, sig))
             except Exception as e:
                 messages.append(f"{ticker} | {mode}: שגיאה {str(e)[:100]}")
-            time.sleep(0.05)
+            time.sleep(0.03)
+
+    if not candidates:
+        return messages + ["לא נמצאו עסקאות עם ניקוד מספיק גבוה."]
+
+    candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    opened = 0
+
+    for _, _, sig in candidates:
+        if opened >= max_to_open:
+            break
+        ok, msg = open_trade(sig, min_score)
+        if ok:
+            opened += 1
+            messages.append(msg)
+        elif "לא משתלם" in msg or "Cooldown" in msg or "כבר יש עסקה" in msg:
+            messages.append(msg)
+
+    if opened == 0:
+        messages.append("נסרקו איתותים, אבל לא נפתחה עסקה בגלל עלויות / cooldown / עסקאות קיימות.")
+    else:
+        messages.append(f"נפתחו {opened} עסקאות חדשות מתוך מקסימום {max_to_open}.")
 
     return messages
 
@@ -1278,6 +1435,15 @@ def render_open_trades(open_trades):
                 else:
                     st.error(msg)
 
+            show_chart = st.checkbox("📈 הצג גרף חי עם אינדיקטורים", key=f"show_chart_{r['trade_id']}")
+            if show_chart:
+                with st.spinner("טוען גרף חי..."):
+                    fig = make_live_trade_chart(str(r["ticker"]), row=r)
+                if fig is not None:
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.warning("לא נמצאו נתונים לגרף כרגע.")
+
         st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -1328,7 +1494,7 @@ def render_closed_trades(closed_trades):
 st.markdown(
     """
 <div class="title-box">
-<h1>🧪 Paper Trading Lab V3</h1>
+<h1>🧪 Paper Trading Lab V4</h1>
 <p>אפליקציית Paper Trading נקייה: יעד מחזור 50$, סטופ ידני, סיבות יציאה, Break-even אחרי עלויות וצמצום הפסדים.</p>
 </div>
 """,
@@ -1372,6 +1538,8 @@ with tab_paper:
     with b:
         modes = st.multiselect("סוג השקעה", ["מהירה", "חצי שעה"], default=["מהירה", "חצי שעה"])
         min_score = st.slider("מינימום ניקוד לפתיחה", 1, 8, 4)
+        max_new_now = st.number_input("כמה עסקאות חדשות לפתוח בסריקה", 1, 20, int(load_rules().get("max_new_trades_per_scan", 3)))
+        max_open_now = st.number_input("מקסימום עסקאות פתוחות במקביל", 1, 30, int(load_rules().get("max_open_trades", 6)))
 
     with c:
         run_scan = st.button("▶️ סרוק ופתח עסקאות", use_container_width=True)
@@ -1399,7 +1567,7 @@ with tab_paper:
             st.warning("בחר מניות וסוג השקעה.")
         else:
             with st.spinner("סורק, בודק ניקוד, עלויות ו־cooldown..."):
-                msgs = scan_and_open(selected_tickers, modes, min_score)
+                msgs = scan_and_open(selected_tickers, modes, min_score, max_new_override=max_new_now, max_open_override=max_open_now)
                 trades, _ = update_open_trades()
 
             if msgs:
@@ -1498,6 +1666,7 @@ with tab_rules:
         min_hold_half = st.number_input("מינימום החזקה לעסקת חצי שעה, בדקות", 0, 120, int(rules["min_hold_half_hour_minutes"]))
         cooldown = st.number_input("Cooldown אחרי סגירה, בדקות", 0, 120, int(rules["cooldown_after_close_minutes"]))
         max_new = st.number_input("מקסימום עסקאות חדשות בכל סריקה", 1, 20, int(rules["max_new_trades_per_scan"]))
+        max_open_rule = st.number_input("מקסימום עסקאות פתוחות במקביל", 1, 30, int(rules.get("max_open_trades", 6)))
         cycle_target = st.number_input("יעד רווח נטו למחזור ($)", 1.0, 10000.0, float(rules["cycle_net_profit_target"]), 1.0)
 
     with r2:
@@ -1530,6 +1699,7 @@ with tab_rules:
             "min_hold_half_hour_minutes": int(min_hold_half),
             "cooldown_after_close_minutes": int(cooldown),
             "max_new_trades_per_scan": int(max_new),
+            "max_open_trades": int(max_open_rule),
             "cycle_net_profit_target": float(cycle_target),
             "min_profit_r_for_profit_stop": float(profit_r),
             "emergency_exit_after_minutes": int(emergency_minutes),
@@ -1609,7 +1779,7 @@ with tab_help:
 - ווליום
 - מבנה נרות
 
-### מה נוסף ב־V3?
+### מה נוסף ב־V4?
 
 **זמן יציאה ומשך עסקה**  
 בכל עסקה סגורה מופיע זמן יציאה וגם משך העסקה בדקות.
