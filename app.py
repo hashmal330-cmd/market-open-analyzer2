@@ -14,20 +14,28 @@ import yfinance as yf
 # App setup
 # ============================================================
 
-st.set_page_config(page_title="Paper Trading Lab V2", page_icon="🧪", layout="wide")
+st.set_page_config(page_title="Paper Trading Lab V3", page_icon="🧪", layout="wide")
 
 DATA_DIR = Path("paper_data")
 DATA_DIR.mkdir(exist_ok=True)
 
-TRADES_FILE = DATA_DIR / "trades_v2.csv"
-TICKERS_FILE = DATA_DIR / "tickers_v2.json"
-COSTS_FILE = DATA_DIR / "costs_v2.json"
-UNITS_FILE = DATA_DIR / "units_v2.json"
-RULES_FILE = DATA_DIR / "rules_v2.json"
+TRADES_FILE = DATA_DIR / "trades_v3.csv"
+TICKERS_FILE = DATA_DIR / "tickers_v3.json"
+COSTS_FILE = DATA_DIR / "costs_v3.json"
+UNITS_FILE = DATA_DIR / "units_v3.json"
+RULES_FILE = DATA_DIR / "rules_v3.json"
+ACCOUNT_FILE = DATA_DIR / "account_v3.json"
 
 NY_TZ = "America/New_York"
 
-DEFAULT_TICKERS = ["QQQ", "SPY", "AAPL", "NVDA", "TSLA", "MSFT", "AMD", "META", "AMZN", "GOOGL", "NFLX", "SMCI", "PLTR", "MSTR"]
+DEFAULT_TICKERS = [
+    "QQQ", "SPY", "IWM", "DIA", "TQQQ", "SQQQ",
+    "AAPL", "MSFT", "NVDA", "AMD", "AVGO", "ARM", "INTC", "MU", "MRVL", "SMCI",
+    "TSLA", "META", "GOOGL", "AMZN", "NFLX",
+    "PLTR", "MSTR", "COIN", "HOOD", "SOFI", "UBER", "SHOP", "SNOW",
+    "CRM", "ORCL", "ADBE", "PANW", "CRWD", "BABA",
+    "JPM", "BAC", "XOM", "CVX", "LLY", "UNH",
+]
 
 DEFAULT_COSTS = {
     "cost_pct_per_side": 0.02,
@@ -50,20 +58,36 @@ DEFAULT_RULES = {
     "min_hold_half_hour_minutes": 10,
     "cooldown_after_close_minutes": 8,
     "max_new_trades_per_scan": 3,
-    "min_profit_r_for_profit_stop": 0.55,
+
+    # Profit-taking and protection
+    "cycle_net_profit_target": 50.0,
+    "min_profit_r_for_profit_stop": 0.45,
     "emergency_exit_after_minutes": 2,
+    "breakeven_after_profit_dollars": 4.0,
+    "lock_profit_after_net_dollars": 8.0,
+    "max_allowed_loss_per_trade_dollars": 20.0,
+    "exit_if_profitable_trade_turns_red": True,
+    "exit_on_target_when_score_below": 7,
+}
+
+DEFAULT_ACCOUNT = {
+    "starting_balance": 10000.0,
+    "cycles_completed": 0,
+    "locked_profit": 0.0,
+    "last_cycle_closed_at": "",
+    "last_cycle_reason": "",
 }
 
 TRADE_COLUMNS = [
     "trade_id", "status", "ticker", "mode", "side", "score",
-    "entry_time", "exit_time", "age_minutes",
+    "entry_time", "exit_time", "duration_minutes", "age_minutes",
     "entry_price", "current_price", "exit_price",
     "quantity", "notional",
-    "stop_loss", "initial_stop_loss", "profit_stop", "target_reference",
-    "highest_price", "lowest_price",
+    "stop_loss", "initial_stop_loss", "manual_stop_loss", "profit_stop", "target_reference", "breakeven_price",
+    "highest_price", "lowest_price", "max_net_pnl_seen",
     "entry_cost", "exit_cost", "total_cost",
     "gross_pnl", "net_pnl", "net_pnl_pct",
-    "exit_reason", "management_action", "management_reason", "signal_reason",
+    "exit_reason", "exit_reason_he", "management_action", "management_reason", "signal_reason",
     "cost_pct_per_side", "fixed_fee_per_side", "min_fee_per_side", "max_cost_to_target_pct",
     "base_unit_dollars", "unit_multiplier",
     "created_settings_snapshot",
@@ -156,7 +180,10 @@ def write_json(path, data):
 
 def load_tickers():
     data = read_json(TICKERS_FILE, {"tickers": DEFAULT_TICKERS})
-    return sorted(set(normalize_ticker(x) for x in data.get("tickers", DEFAULT_TICKERS) if normalize_ticker(x)))
+    tickers = sorted(set(normalize_ticker(x) for x in data.get("tickers", DEFAULT_TICKERS) if normalize_ticker(x)))
+    if len(tickers) < 20:
+        tickers = sorted(set(tickers + DEFAULT_TICKERS))
+    return tickers
 
 def save_tickers(tickers):
     write_json(TICKERS_FILE, {"tickers": sorted(set(normalize_ticker(x) for x in tickers if normalize_ticker(x)))})
@@ -178,6 +205,50 @@ def load_rules():
 
 def save_rules(rules):
     write_json(RULES_FILE, rules)
+
+def load_account():
+    return read_json(ACCOUNT_FILE, DEFAULT_ACCOUNT)
+
+def save_account(account):
+    write_json(ACCOUNT_FILE, account)
+
+def reset_account():
+    save_account(DEFAULT_ACCOUNT)
+
+def timestamp_to_ny(ts):
+    try:
+        out = pd.Timestamp(ts)
+        if out.tzinfo is None:
+            out = out.tz_localize(NY_TZ)
+        else:
+            out = out.tz_convert(NY_TZ)
+        return out
+    except Exception:
+        return None
+
+def minutes_between(start, end):
+    s = timestamp_to_ny(start)
+    e = timestamp_to_ny(end)
+    if s is None or e is None:
+        return 0.0
+    return max(0.0, (e - s).total_seconds() / 60.0)
+
+def exit_reason_he(reason):
+    mapping = {
+        "STOP_LOSS": "הגענו לסטופ לוס",
+        "PROFIT_STOP": "העסקה הייתה ברווח וחזרה לסטופ רווח",
+        "TARGET_REACHED": "הגענו ליעד רווח",
+        "TARGET_REACHED_SCORE_EXIT": "הגענו ליעד והניקוד לא מצדיק להישאר",
+        "EARLY_EXIT_AGAINST_LONG": "יציאה מוקדמת: לונג התחיל לרדת מהר",
+        "EARLY_EXIT_AGAINST_SHORT": "יציאה מוקדמת: שורט התחיל לעלות מהר",
+        "BREAKEVEN_AFTER_COSTS": "העסקה הייתה ברווח וחזרה לאזור איזון אחרי עלויות",
+        "LOCKED_SMALL_PROFIT": "נלקח רווח קטן אחרי עלויות כדי לצמצם סיכון",
+        "MAX_LOSS_LIMIT": "הפסד הגיע למגבלת ההפסד לעסקה",
+        "MANUAL_CLOSE": "סגירה ידנית",
+        "CYCLE_TARGET_50": "מחזור רווח הושלם: נסגר בגלל יעד רווח נטו",
+    }
+    return mapping.get(str(reason), str(reason or ""))
+
 
 def empty_trades():
     return pd.DataFrame(columns=TRADE_COLUMNS)
@@ -376,6 +447,30 @@ def pnl_for_trade(row, current_price):
     }
 
 
+def breakeven_after_costs(row):
+    """
+    Approximate breakeven price after entry+exit costs.
+    Long needs price above entry; short needs price below entry.
+    """
+    entry = safe_float(row["entry_price"])
+    qty = safe_float(row["quantity"])
+    if qty <= 0:
+        return entry
+
+    costs = {
+        "cost_pct_per_side": safe_float(row["cost_pct_per_side"], DEFAULT_COSTS["cost_pct_per_side"]),
+        "fixed_fee_per_side": safe_float(row["fixed_fee_per_side"], DEFAULT_COSTS["fixed_fee_per_side"]),
+        "min_fee_per_side": safe_float(row["min_fee_per_side"], DEFAULT_COSTS["min_fee_per_side"]),
+    }
+    _, _, total_cost = estimate_costs(entry, entry, qty, costs)
+    buffer_per_share = total_cost / qty
+
+    if str(row["side"]) == "LONG":
+        return entry + buffer_per_share
+    return entry - buffer_per_share
+
+
+
 # ============================================================
 # Signal logic
 # ============================================================
@@ -517,15 +612,10 @@ def make_signal(ticker, mode):
 # ============================================================
 
 def trade_age_minutes(row):
-    try:
-        entry = pd.Timestamp(row["entry_time"])
-        if entry.tzinfo is None:
-            entry = entry.tz_localize(NY_TZ)
-        else:
-            entry = entry.tz_convert(NY_TZ)
-        return max(0.0, (now_ny() - entry).total_seconds() / 60)
-    except Exception:
+    entry = timestamp_to_ny(row.get("entry_time"))
+    if entry is None:
         return 0.0
+    return max(0.0, (now_ny() - entry).total_seconds() / 60.0)
 
 def min_hold_for_mode(mode, rules):
     if str(mode) == "מהירה":
@@ -612,6 +702,7 @@ def open_trade(signal, min_score):
         "score": score,
         "entry_time": now_ny_iso(),
         "exit_time": "",
+        "duration_minutes": 0.0,
         "age_minutes": 0.0,
         "entry_price": entry,
         "current_price": entry,
@@ -620,10 +711,13 @@ def open_trade(signal, min_score):
         "notional": notional,
         "stop_loss": stop,
         "initial_stop_loss": stop,
+        "manual_stop_loss": np.nan,
         "profit_stop": np.nan,
         "target_reference": target,
+        "breakeven_price": np.nan,
         "highest_price": entry,
         "lowest_price": entry,
+        "max_net_pnl_seen": -total_cost_now,
         "entry_cost": entry_cost,
         "exit_cost": exit_cost,
         "total_cost": total_cost_now,
@@ -631,6 +725,7 @@ def open_trade(signal, min_score):
         "net_pnl": -total_cost_now,
         "net_pnl_pct": (-total_cost_now / notional) * 100 if notional else 0,
         "exit_reason": "",
+        "exit_reason_he": "",
         "management_action": "OPENED",
         "management_reason": "נפתחה עסקה אחרי בדיקת ניקוד, עלויות ויוניטים.",
         "signal_reason": signal.get("reason", ""),
@@ -642,11 +737,40 @@ def open_trade(signal, min_score):
         "unit_multiplier": unit_mult,
         "created_settings_snapshot": json.dumps({"costs": costs, "units": units, "rules": rules}, ensure_ascii=False),
     }
+    row["breakeven_price"] = breakeven_after_costs(row)
 
     trades = pd.concat([trades, pd.DataFrame([row])], ignore_index=True)
     save_trades(trades)
 
     return True, f"{ticker}: נפתחה {side} | {mode} | ניקוד {score} | יוניטים {unit_mult} | נטו צפוי ליעד ${en:.2f}."
+
+
+def update_trade_stop(trade_id, new_stop):
+    trades = load_trades()
+    if trades.empty:
+        return False, "אין עסקאות."
+
+    mask = trades["trade_id"].astype(str).eq(str(trade_id)) & trades["status"].eq("OPEN")
+    if not mask.any():
+        return False, "העסקה לא נמצאה או כבר סגורה."
+
+    idx = trades.index[mask][0]
+    side = str(trades.loc[idx, "side"])
+    current = safe_float(trades.loc[idx, "current_price"])
+    new_stop = float(new_stop)
+
+    if side == "LONG" and new_stop >= current:
+        return False, "בלונג הסטופ צריך להיות מתחת למחיר הנוכחי."
+    if side == "SHORT" and new_stop <= current:
+        return False, "בשורט הסטופ צריך להיות מעל המחיר הנוכחי."
+
+    trades.loc[idx, "stop_loss"] = new_stop
+    trades.loc[idx, "manual_stop_loss"] = new_stop
+    trades.loc[idx, "management_action"] = "MANUAL_STOP_UPDATE"
+    trades.loc[idx, "management_reason"] = f"הסטופ עודכן ידנית ל־{new_stop:.2f}."
+    save_trades(trades)
+    return True, "הסטופ עודכן."
+
 
 def manage_trade(row, df_after_entry):
     rules = load_rules()
@@ -659,6 +783,7 @@ def manage_trade(row, df_after_entry):
     target = safe_float(row["target_reference"])
     age = trade_age_minutes(row)
     min_hold = min_hold_for_mode(mode, rules)
+    current_max_net_seen = safe_float(row.get("max_net_pnl_seen"), safe_float(row.get("net_pnl"), 0))
 
     res = {
         "exit": False,
@@ -668,6 +793,7 @@ def manage_trade(row, df_after_entry):
         "target_reference": target,
         "highest_price": safe_float(row.get("highest_price"), entry),
         "lowest_price": safe_float(row.get("lowest_price"), entry),
+        "max_net_pnl_seen": current_max_net_seen,
         "action": "HOLD",
         "reason": "מחזיק, אין שינוי.",
     }
@@ -686,6 +812,10 @@ def manage_trade(row, df_after_entry):
     res["highest_price"] = high_since
     res["lowest_price"] = low_since
 
+    current_pnl = pnl_for_trade(row, current)
+    current_net = current_pnl["net_pnl"]
+    res["max_net_pnl_seen"] = max(current_max_net_seen, current_net)
+
     base_risk = abs(entry - initial_stop)
     if base_risk <= 0:
         base_risk = max(entry * 0.001, abs(entry - stop))
@@ -699,19 +829,25 @@ def manage_trade(row, df_after_entry):
     ema5_curv = safe_float(last["ema5_curv"], 0)
     macd_slope = safe_float(last["macd_hist_slope"], 0)
 
-    # Higher score gets more room to run. Lower score is managed tighter.
+    breakeven = safe_float(row.get("breakeven_price"), breakeven_after_costs(row))
+
     if score >= 7:
-        trail_r = 0.95
+        trail_r = 0.70
     elif score >= 6:
-        trail_r = 0.75
-    elif score >= 5:
         trail_r = 0.55
+    elif score >= 5:
+        trail_r = 0.40
     else:
-        trail_r = 0.38
+        trail_r = 0.28
 
     actions, reasons = [], []
 
-    # Hard stop is allowed immediately. Everything else waits at least min hold.
+    if current_net <= -abs(float(rules["max_allowed_loss_per_trade_dollars"])):
+        res["exit"] = True
+        res["exit_reason"] = "MAX_LOSS_LIMIT"
+        actions.append("EXIT_MAX_LOSS")
+        reasons.append("הפסד נטו הגיע למגבלת ההפסד לעסקה.")
+
     if side == "LONG":
         r_now = (current - entry) / base_risk
         best_r = (high_since - entry) / base_risk
@@ -720,48 +856,65 @@ def manage_trade(row, df_after_entry):
             res["exit"] = True
             res["exit_reason"] = "STOP_LOSS"
             actions.append("EXIT_STOP")
-            reasons.append("הגיע לסטופ.")
+            reasons.append("הגענו לסטופ לוס.")
+
+        if (
+            bool(rules["exit_if_profitable_trade_turns_red"])
+            and age >= float(rules["emergency_exit_after_minutes"])
+            and res["max_net_pnl_seen"] >= float(rules["breakeven_after_profit_dollars"])
+            and current <= breakeven
+        ):
+            res["exit"] = True
+            res["exit_reason"] = "BREAKEVEN_AFTER_COSTS"
+            actions.append("EXIT_BREAKEVEN")
+            reasons.append("העסקה הייתה ברווח וחזרה למחיר איזון אחרי עלויות.")
 
         if age >= min_hold:
+            if current_net >= float(rules["breakeven_after_profit_dollars"]):
+                new_profit_stop = max(breakeven, current - 0.35 * base_risk)
+                if not np.isfinite(res["profit_stop"]) or new_profit_stop > res["profit_stop"]:
+                    res["profit_stop"] = new_profit_stop
+                    actions.append("SET_BREAKEVEN_PROFIT_STOP")
+                    reasons.append("יש רווח אחרי עלויות, סטופ רווח הועלה לפחות לאיזון.")
+
             if best_r >= float(rules["min_profit_r_for_profit_stop"]):
-                new_profit_stop = max(entry + 0.05 * base_risk, high_since - trail_r * base_risk)
+                new_profit_stop = max(breakeven, high_since - trail_r * base_risk)
                 if not np.isfinite(res["profit_stop"]) or new_profit_stop > res["profit_stop"]:
                     res["profit_stop"] = new_profit_stop
                     actions.append("RAISE_PROFIT_STOP")
                     reasons.append("העסקה ברווח, סטופ רווח עלה.")
 
-            if score >= 6 and r_now >= 0.85 and current > ema5 and ema5_slope > 0:
-                new_target = max(target, current + 1.25 * base_risk)
+            if score >= 7 and r_now >= 0.85 and current > ema5 and ema5_slope > 0:
+                new_target = max(target, current + 0.80 * base_risk)
                 if new_target > target:
                     res["target_reference"] = new_target
                     actions.append("EXTEND_TARGET")
                     reasons.append("ניקוד גבוה ומומנטום חיובי — נותנים לעסקה לרוץ.")
 
-            if score < 6 and current >= target:
+            if current >= target and score < int(rules["exit_on_target_when_score_below"]):
                 res["exit"] = True
-                res["exit_reason"] = "TARGET_REACHED"
+                res["exit_reason"] = "TARGET_REACHED_SCORE_EXIT"
                 actions.append("EXIT_TARGET")
-                reasons.append("ניקוד לא גבוה, יציאה ביעד.")
+                reasons.append("הגענו ליעד, הניקוד לא מספיק גבוה כדי להמשיך.")
 
             if np.isfinite(res["profit_stop"]) and current <= res["profit_stop"]:
                 res["exit"] = True
                 res["exit_reason"] = "PROFIT_STOP"
                 actions.append("EXIT_PROFIT_STOP")
-                reasons.append("חזרה לסטופ רווח.")
+                reasons.append("המחיר חזר לסטופ רווח.")
 
-            if best_r >= 0.7 and (red >= 2 or ema5_curv < 0 or macd_slope < 0):
-                tightened = current - 0.28 * base_risk
+            if res["max_net_pnl_seen"] >= float(rules["lock_profit_after_net_dollars"]) and (red >= 2 or ema5_curv < 0 or macd_slope < 0):
+                tightened = max(breakeven, current - 0.18 * base_risk)
                 if not np.isfinite(res["profit_stop"]) or tightened > res["profit_stop"]:
                     res["profit_stop"] = tightened
                     actions.append("TIGHTEN_PROFIT_STOP")
-                    reasons.append("אחרי רווח יש היחלשות, סטופ רווח הודק.")
+                    reasons.append("אחרי רווח יש היחלשות, סטופ רווח הודק כדי לא להחזיר רווח.")
 
-        # Emergency exit only after a short minimum, to avoid instant entry/exit.
-        if age >= float(rules["emergency_exit_after_minutes"]) and r_now < -0.30 and red >= 2 and current < ema5 and ema5_slope < 0:
+        if age >= float(rules["emergency_exit_after_minutes"]) and r_now < -0.25 and red >= 2 and current < ema5 and ema5_slope < 0:
             res["exit"] = True
             res["exit_reason"] = "EARLY_EXIT_AGAINST_LONG"
             actions.append("EARLY_EXIT")
-            reasons.append("העסקה הולכת חזק נגד לונג, יציאה מוקדמת.")
+            reasons.append("לונג הולך חזק נגד הכיוון, יציאה מוקדמת.")
 
     else:
         r_now = (entry - current) / base_risk
@@ -771,53 +924,135 @@ def manage_trade(row, df_after_entry):
             res["exit"] = True
             res["exit_reason"] = "STOP_LOSS"
             actions.append("EXIT_STOP")
-            reasons.append("הגיע לסטופ.")
+            reasons.append("הגענו לסטופ לוס.")
+
+        if (
+            bool(rules["exit_if_profitable_trade_turns_red"])
+            and age >= float(rules["emergency_exit_after_minutes"])
+            and res["max_net_pnl_seen"] >= float(rules["breakeven_after_profit_dollars"])
+            and current >= breakeven
+        ):
+            res["exit"] = True
+            res["exit_reason"] = "BREAKEVEN_AFTER_COSTS"
+            actions.append("EXIT_BREAKEVEN")
+            reasons.append("העסקה הייתה ברווח וחזרה למחיר איזון אחרי עלויות.")
 
         if age >= min_hold:
+            if current_net >= float(rules["breakeven_after_profit_dollars"]):
+                new_profit_stop = min(breakeven, current + 0.35 * base_risk)
+                if not np.isfinite(res["profit_stop"]) or new_profit_stop < res["profit_stop"]:
+                    res["profit_stop"] = new_profit_stop
+                    actions.append("SET_BREAKEVEN_PROFIT_STOP")
+                    reasons.append("יש רווח אחרי עלויות, סטופ רווח ירד לפחות לאיזון.")
+
             if best_r >= float(rules["min_profit_r_for_profit_stop"]):
-                new_profit_stop = min(entry - 0.05 * base_risk, low_since + trail_r * base_risk)
+                new_profit_stop = min(breakeven, low_since + trail_r * base_risk)
                 if not np.isfinite(res["profit_stop"]) or new_profit_stop < res["profit_stop"]:
                     res["profit_stop"] = new_profit_stop
                     actions.append("LOWER_PROFIT_STOP")
                     reasons.append("העסקה ברווח, סטופ רווח ירד.")
 
-            if score >= 6 and r_now >= 0.85 and current < ema5 and ema5_slope < 0:
-                new_target = min(target, current - 1.25 * base_risk)
+            if score >= 7 and r_now >= 0.85 and current < ema5 and ema5_slope < 0:
+                new_target = min(target, current - 0.80 * base_risk)
                 if new_target < target:
                     res["target_reference"] = new_target
                     actions.append("EXTEND_TARGET")
                     reasons.append("ניקוד גבוה ומומנטום שלילי — נותנים לשורט לרוץ.")
 
-            if score < 6 and current <= target:
+            if current <= target and score < int(rules["exit_on_target_when_score_below"]):
                 res["exit"] = True
-                res["exit_reason"] = "TARGET_REACHED"
+                res["exit_reason"] = "TARGET_REACHED_SCORE_EXIT"
                 actions.append("EXIT_TARGET")
-                reasons.append("ניקוד לא גבוה, יציאה ביעד.")
+                reasons.append("הגענו ליעד, הניקוד לא מספיק גבוה כדי להמשיך.")
 
             if np.isfinite(res["profit_stop"]) and current >= res["profit_stop"]:
                 res["exit"] = True
                 res["exit_reason"] = "PROFIT_STOP"
                 actions.append("EXIT_PROFIT_STOP")
-                reasons.append("חזרה לסטופ רווח.")
+                reasons.append("המחיר חזר לסטופ רווח.")
 
-            if best_r >= 0.7 and (green >= 2 or ema5_curv > 0 or macd_slope > 0):
-                tightened = current + 0.28 * base_risk
+            if res["max_net_pnl_seen"] >= float(rules["lock_profit_after_net_dollars"]) and (green >= 2 or ema5_curv > 0 or macd_slope > 0):
+                tightened = min(breakeven, current + 0.18 * base_risk)
                 if not np.isfinite(res["profit_stop"]) or tightened < res["profit_stop"]:
                     res["profit_stop"] = tightened
                     actions.append("TIGHTEN_PROFIT_STOP")
-                    reasons.append("אחרי רווח יש היחלשות, סטופ רווח הודק.")
+                    reasons.append("אחרי רווח יש היחלשות, סטופ רווח הודק כדי לא להחזיר רווח.")
 
-        if age >= float(rules["emergency_exit_after_minutes"]) and r_now < -0.30 and green >= 2 and current > ema5 and ema5_slope > 0:
+        if age >= float(rules["emergency_exit_after_minutes"]) and r_now < -0.25 and green >= 2 and current > ema5 and ema5_slope > 0:
             res["exit"] = True
             res["exit_reason"] = "EARLY_EXIT_AGAINST_SHORT"
             actions.append("EARLY_EXIT")
-            reasons.append("העסקה הולכת חזק נגד שורט, יציאה מוקדמת.")
+            reasons.append("שורט הולך חזק נגד הכיוון, יציאה מוקדמת.")
 
     if actions:
         res["action"] = " + ".join(sorted(set(actions)))
         res["reason"] = " ".join(reasons)
 
     return res
+
+
+def close_trade_at_index(trades, idx, current, reason):
+    pnl = pnl_for_trade(trades.loc[idx], current)
+    for k, v in pnl.items():
+        trades.loc[idx, k] = v
+
+    exit_time = now_ny_iso()
+    trades.loc[idx, "current_price"] = current
+    trades.loc[idx, "exit_price"] = current
+    trades.loc[idx, "status"] = "CLOSED"
+    trades.loc[idx, "exit_time"] = exit_time
+    trades.loc[idx, "duration_minutes"] = minutes_between(trades.loc[idx, "entry_time"], exit_time)
+    trades.loc[idx, "age_minutes"] = trades.loc[idx, "duration_minutes"]
+    trades.loc[idx, "exit_reason"] = reason
+    trades.loc[idx, "exit_reason_he"] = exit_reason_he(reason)
+    return trades, pnl
+
+def current_total_net(trades):
+    if trades.empty:
+        return 0.0
+    return float(pd.to_numeric(trades["net_pnl"], errors="coerce").fillna(0).sum())
+
+def check_cycle_target_and_close():
+    trades = load_trades()
+    messages = []
+    if trades.empty:
+        return trades, messages
+
+    account = load_account()
+    rules = load_rules()
+    target = float(rules["cycle_net_profit_target"])
+    locked_profit = float(account.get("locked_profit", 0.0))
+    total_net = current_total_net(trades)
+    cycle_profit = total_net - locked_profit
+
+    if cycle_profit < target:
+        return trades, messages
+
+    open_idx = trades.index[trades["status"].eq("OPEN")].tolist()
+
+    for idx in open_idx:
+        ticker = str(trades.loc[idx, "ticker"])
+        try:
+            df = latest_session(fetch_1m(ticker))
+            current = safe_float(df.iloc[-1]["close"]) if not df.empty else safe_float(trades.loc[idx, "current_price"])
+        except Exception:
+            current = safe_float(trades.loc[idx, "current_price"])
+
+        trades, pnl = close_trade_at_index(trades, idx, current, "CYCLE_TARGET_50")
+        trades.loc[idx, "management_action"] = "CYCLE_CLOSE"
+        trades.loc[idx, "management_reason"] = f"נסגר כי המחזור הגיע ליעד רווח נטו של ${target:.2f}."
+
+    total_net = current_total_net(trades)
+    account["cycles_completed"] = int(account.get("cycles_completed", 0)) + 1
+    account["locked_profit"] = float(total_net)
+    account["last_cycle_closed_at"] = now_ny_iso()
+    account["last_cycle_reason"] = f"המחזור הגיע ליעד רווח נטו של ${target:.2f}."
+
+    save_account(account)
+    save_trades(trades)
+    messages.append(f"מחזור רווח הושלם: הגעת ל־${target:.2f} נטו מעל המחזור הקודם. כל העסקאות הפתוחות נסגרו.")
+
+    return trades, messages
 
 def update_open_trades():
     trades = load_trades()
@@ -834,25 +1069,25 @@ def update_open_trades():
                 continue
 
             current = safe_float(df.iloc[-1]["close"])
-            entry_time = pd.Timestamp(trades.loc[idx, "entry_time"])
-            if entry_time.tzinfo is None:
-                entry_time = entry_time.tz_localize(NY_TZ)
-            else:
-                entry_time = entry_time.tz_convert(NY_TZ)
-
-            after_entry = df[df.index >= entry_time]
-            if after_entry.empty:
+            entry_time = timestamp_to_ny(trades.loc[idx, "entry_time"])
+            if entry_time is None:
                 after_entry = df.tail(5)
+            else:
+                after_entry = df[df.index >= entry_time]
+                if after_entry.empty:
+                    after_entry = df.tail(5)
 
             decision = manage_trade(trades.loc[idx], after_entry)
 
             trades.loc[idx, "age_minutes"] = trade_age_minutes(trades.loc[idx])
+            trades.loc[idx, "duration_minutes"] = trades.loc[idx, "age_minutes"]
             trades.loc[idx, "current_price"] = current
             trades.loc[idx, "stop_loss"] = decision["stop_loss"]
             trades.loc[idx, "profit_stop"] = decision["profit_stop"]
             trades.loc[idx, "target_reference"] = decision["target_reference"]
             trades.loc[idx, "highest_price"] = decision["highest_price"]
             trades.loc[idx, "lowest_price"] = decision["lowest_price"]
+            trades.loc[idx, "max_net_pnl_seen"] = decision["max_net_pnl_seen"]
             trades.loc[idx, "management_action"] = decision["action"]
             trades.loc[idx, "management_reason"] = decision["reason"]
 
@@ -861,17 +1096,16 @@ def update_open_trades():
                 trades.loc[idx, k] = v
 
             if decision["exit"]:
-                trades.loc[idx, "status"] = "CLOSED"
-                trades.loc[idx, "exit_time"] = now_ny_iso()
-                trades.loc[idx, "exit_price"] = current
-                trades.loc[idx, "exit_reason"] = decision["exit_reason"]
-                messages.append(f"{ticker}: נסגרה עסקה — {decision['exit_reason']} | נטו ${pnl['net_pnl']:.2f}")
+                trades, pnl = close_trade_at_index(trades, idx, current, decision["exit_reason"])
+                messages.append(f"{ticker}: נסגרה עסקה — {exit_reason_he(decision['exit_reason'])} | נטו ${pnl['net_pnl']:.2f}")
 
         except Exception as e:
             trades.loc[idx, "management_action"] = "ERROR"
             trades.loc[idx, "management_reason"] = str(e)[:180]
 
     save_trades(trades)
+    trades, cycle_msgs = check_cycle_target_and_close()
+    messages.extend(cycle_msgs)
     return trades, messages
 
 def close_trade_manually(trade_id):
@@ -889,20 +1123,12 @@ def close_trade_manually(trade_id):
     except Exception:
         current = safe_float(trades.loc[idx, "current_price"])
 
-    pnl = pnl_for_trade(trades.loc[idx], current)
-    for k, v in pnl.items():
-        trades.loc[idx, k] = v
-
-    trades.loc[idx, "current_price"] = current
-    trades.loc[idx, "exit_price"] = current
-    trades.loc[idx, "status"] = "CLOSED"
-    trades.loc[idx, "exit_time"] = now_ny_iso()
-    trades.loc[idx, "exit_reason"] = "MANUAL_CLOSE"
+    trades, pnl = close_trade_at_index(trades, idx, current, "MANUAL_CLOSE")
     trades.loc[idx, "management_action"] = "MANUAL_CLOSE"
     trades.loc[idx, "management_reason"] = "נסגר ידנית על ידי המשתמש."
-
     save_trades(trades)
     return True, f"{ticker}: נסגר ידנית במחיר {current:.2f}. נטו ${pnl['net_pnl']:.2f}"
+
 
 def scan_and_open(tickers, modes, min_score):
     messages = []
@@ -940,6 +1166,9 @@ def fmt_price(x):
 def fmt_money(x):
     return f"${safe_float(x, 0):,.2f}"
 
+def fmt_minutes(x):
+    return f"{safe_float(x, 0):.1f}"
+
 def summary_stats(trades):
     if trades.empty:
         return {
@@ -963,16 +1192,28 @@ def summary_stats(trades):
 
 def render_summary(trades):
     stats = summary_stats(trades)
+    account = load_account()
+    balance = float(account.get("starting_balance", 10000.0)) + stats["net_total"]
+    cycle_profit = stats["net_total"] - float(account.get("locked_profit", 0.0))
+    target = float(load_rules()["cycle_net_profit_target"])
+
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("רווח כולל נטו", fmt_money(stats["net_total"]))
     c2.metric("רווח מהעסקאות ברוטו", fmt_money(stats["gross_total"]))
     c3.metric("עלות כניסה כוללת", fmt_money(stats["entry_cost_total"]))
     c4.metric("סך כל העלויות", fmt_money(stats["cost_total"]))
 
-    d1, d2, d3 = st.columns(3)
+    d1, d2, d3, d4 = st.columns(4)
     d1.metric("כמות עסקאות שנפתחו", stats["opened_count"])
     d2.metric("עסקאות כעת", stats["open_count"])
     d3.metric("עסקאות סגורות", stats["closed_count"])
+    d4.metric("יתרת חשבון דמו", fmt_money(balance))
+
+    e1, e2, e3 = st.columns(3)
+    e1.metric("מחזורים שהושלמו", int(account.get("cycles_completed", 0)))
+    e2.metric("רווח נעול במחזורים", fmt_money(account.get("locked_profit", 0.0)))
+    e3.metric(f"רווח במחזור הנוכחי / יעד {fmt_money(target)}", fmt_money(cycle_profit))
+
 
 def render_open_trades(open_trades):
     st.markdown("### עסקאות כעת")
@@ -981,8 +1222,8 @@ def render_open_trades(open_trades):
         st.info("אין עסקאות פתוחות כרגע.")
         return
 
-    head = st.columns([0.65, .8, .9, .7, .85, .85, .85, .85, .9, .95, .75, .7])
-    labels = ["סיים", "מניה", "סוג", "כיוון", "כניסה", "נוכחי", "סטופ", "סטופ רווח", "רווח/הפסד", "זמן כניסה", "גיל דק׳", "ניקוד"]
+    head = st.columns([0.55, .75, .8, .65, .8, .8, .8, .8, .9, .9, .75, .7])
+    labels = ["סיים", "מניה", "סוג", "כיוון", "כניסה", "נוכחי", "סטופ", "סטופ רווח", "רווח/הפסד", "זמן כניסה", "משך דק׳", "ניקוד"]
     for col, label in zip(head, labels):
         col.markdown(f"**{label}**")
 
@@ -991,7 +1232,7 @@ def render_open_trades(open_trades):
         klass = "green-row" if pnl >= 0 else "red-row"
 
         st.markdown(f"<div class='{klass}'>", unsafe_allow_html=True)
-        row = st.columns([0.65, .8, .9, .7, .85, .85, .85, .85, .9, .95, .75, .7])
+        row = st.columns([0.55, .75, .8, .65, .8, .8, .8, .8, .9, .9, .75, .7])
 
         if row[0].button("סיים", key=f"close_{r['trade_id']}"):
             ok, msg = close_trade_manually(str(r["trade_id"]))
@@ -1010,15 +1251,35 @@ def render_open_trades(open_trades):
         row[7].write(fmt_price(r["profit_stop"]))
         row[8].write(fmt_money(pnl))
         row[9].write(str(r["entry_time"])[:19])
-        row[10].write(f"{safe_float(r['age_minutes'], 0):.1f}")
+        row[10].write(f"{safe_float(r.get('age_minutes', 0), 0):.1f}")
         row[11].write(int(safe_float(r["score"], 0)))
 
-        with st.expander(f"ניהול: {r['ticker']} | {r['mode']} | {str(r['trade_id'])[:8]}"):
+        with st.expander(f"ניהול ושינוי סטופ: {r['ticker']} | {r['mode']} | {str(r['trade_id'])[:8]}"):
             st.write("פעולה אחרונה:", r.get("management_action", ""))
             st.write("סיבה:", r.get("management_reason", ""))
             st.write("למה נכנס:", r.get("signal_reason", ""))
+            st.write("מחיר איזון אחרי עלויות:", fmt_price(r.get("breakeven_price", np.nan)))
+            st.write("רווח מקסימלי שנראה בעסקה:", fmt_money(r.get("max_net_pnl_seen", 0)))
             st.write("עלות כוללת:", fmt_money(r.get("total_cost", 0)))
+
+            current_stop = safe_float(r.get("stop_loss"), safe_float(r.get("initial_stop_loss"), 0))
+            new_stop = st.number_input(
+                "שנה סטופ לוס ידנית",
+                value=float(current_stop),
+                step=0.01,
+                format="%.2f",
+                key=f"manual_stop_{r['trade_id']}",
+            )
+            if st.button("💾 עדכן סטופ לעסקה", key=f"manual_stop_btn_{r['trade_id']}"):
+                ok, msg = update_trade_stop(str(r["trade_id"]), new_stop)
+                if ok:
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)
+
         st.markdown("</div>", unsafe_allow_html=True)
+
 
 def render_closed_trades(closed_trades):
     st.markdown("### עסקאות שהסתיימו")
@@ -1028,6 +1289,10 @@ def render_closed_trades(closed_trades):
         return
 
     d = closed_trades.sort_values("exit_time", ascending=False).copy().reset_index(drop=True)
+    d["exit_reason_he"] = d.apply(
+        lambda r: r["exit_reason_he"] if isinstance(r.get("exit_reason_he", ""), str) and r.get("exit_reason_he", "") else exit_reason_he(r.get("exit_reason", "")),
+        axis=1,
+    )
 
     display = pd.DataFrame({
         "מניה": d["ticker"],
@@ -1040,8 +1305,9 @@ def render_closed_trades(closed_trades):
         "רווח/הפסד": d["net_pnl"].map(fmt_money),
         "זמן כניסה": d["entry_time"].astype(str).str.slice(0, 19),
         "זמן יציאה": d["exit_time"].astype(str).str.slice(0, 19),
+        "משך עסקה בדק׳": d["duration_minutes"].map(fmt_minutes),
         "ניקוד": d["score"].fillna(0).astype(int),
-        "סיבה": d["exit_reason"],
+        "סיבה ליציאה": d["exit_reason_he"],
     })
 
     pnl_values = d["net_pnl"].fillna(0).astype(float).tolist()
@@ -1062,18 +1328,19 @@ def render_closed_trades(closed_trades):
 st.markdown(
     """
 <div class="title-box">
-<h1>🧪 Paper Trading Lab V2</h1>
-<p>אפליקציית Paper Trading נקייה: עסקאות מהירות/חצי שעה, עלויות, יוניטים לפי ניקוד, וסיכום רווח נטו.</p>
+<h1>🧪 Paper Trading Lab V3</h1>
+<p>אפליקציית Paper Trading נקייה: יעד מחזור 50$, סטופ ידני, סיבות יציאה, Break-even אחרי עלויות וצמצום הפסדים.</p>
 </div>
 """,
     unsafe_allow_html=True,
 )
 
-tab_paper, tab_costs, tab_units, tab_rules, tab_help = st.tabs([
+tab_paper, tab_costs, tab_units, tab_rules, tab_account, tab_help = st.tabs([
     "🧪 Paper Trading",
     "💸 עלויות",
     "📦 יוניטים לפי ניקוד",
     "⚙️ חוקים חכמים",
+    "🏦 חשבון ומחזורים",
     "📘 הסבר",
 ])
 
@@ -1222,7 +1489,7 @@ with tab_units:
 
 
 with tab_rules:
-    st.subheader("⚙️ חוקים חכמים נגד כניסה/יציאה מהירה מדי")
+    st.subheader("⚙️ חוקים חכמים לצמצום הפסדים ולקיחת רווחים")
     rules = load_rules()
 
     r1, r2 = st.columns(2)
@@ -1230,18 +1497,28 @@ with tab_rules:
         min_hold_fast = st.number_input("מינימום החזקה לעסקה מהירה, בדקות", 0, 60, int(rules["min_hold_fast_minutes"]))
         min_hold_half = st.number_input("מינימום החזקה לעסקת חצי שעה, בדקות", 0, 120, int(rules["min_hold_half_hour_minutes"]))
         cooldown = st.number_input("Cooldown אחרי סגירה, בדקות", 0, 120, int(rules["cooldown_after_close_minutes"]))
-    with r2:
         max_new = st.number_input("מקסימום עסקאות חדשות בכל סריקה", 1, 20, int(rules["max_new_trades_per_scan"]))
+        cycle_target = st.number_input("יעד רווח נטו למחזור ($)", 1.0, 10000.0, float(rules["cycle_net_profit_target"]), 1.0)
+
+    with r2:
         profit_r = st.number_input("כמה רווח R לפני הפעלת סטופ רווח", 0.1, 3.0, float(rules["min_profit_r_for_profit_stop"]), 0.05)
         emergency_minutes = st.number_input("מינימום דקות לפני יציאה מוקדמת נגד הכיוון", 0, 30, int(rules["emergency_exit_after_minutes"]))
+        breakeven_after = st.number_input("כמה רווח נטו צריך לפני הגנת איזון ($)", 0.0, 500.0, float(rules["breakeven_after_profit_dollars"]), 1.0)
+        lock_profit_after = st.number_input("כמה רווח נטו צריך לפני הידוק אגרסיבי ($)", 0.0, 1000.0, float(rules["lock_profit_after_net_dollars"]), 1.0)
+        max_loss = st.number_input("מקסימום הפסד נטו לעסקה ($)", 1.0, 10000.0, float(rules["max_allowed_loss_per_trade_dollars"]), 1.0)
+        exit_score_below = st.slider("לצאת ביעד אם ניקוד נמוך מ־", 1, 9, int(rules["exit_on_target_when_score_below"]))
+
+    exit_turn_red = st.checkbox(
+        "אם עסקה הייתה ברווח ואז חוזרת לאיזון אחרי עלויות — לצאת",
+        value=bool(rules["exit_if_profitable_trade_turns_red"]),
+    )
 
     st.markdown(
         """
 <div class="card">
-<strong>מה זה עושה?</strong><br>
-האפליקציה לא תיכנס ותצא סתם מהר: היא ממתינה מינימום זמן לפני יציאה רגילה,
-שומרת cooldown אחרי סגירה, ומגבילה כמה עסקאות חדשות נפתחות בכל סריקה.
-סטופ לוס קשיח עדיין יכול לסגור מיד כדי להגן על ההפסד.
+<strong>מטרת החוקים:</strong><br>
+לנסות לצמצם הפסדים, לנעול רווחים קטנים אחרי עלויות, לא להחזיר עסקה מרוויחה להפסד,
+ולתת לעסקאות עם ניקוד גבוה לרוץ רק אם המומנטום עדיין תומך.
 </div>
 """,
         unsafe_allow_html=True,
@@ -1253,17 +1530,58 @@ with tab_rules:
             "min_hold_half_hour_minutes": int(min_hold_half),
             "cooldown_after_close_minutes": int(cooldown),
             "max_new_trades_per_scan": int(max_new),
+            "cycle_net_profit_target": float(cycle_target),
             "min_profit_r_for_profit_stop": float(profit_r),
             "emergency_exit_after_minutes": int(emergency_minutes),
+            "breakeven_after_profit_dollars": float(breakeven_after),
+            "lock_profit_after_net_dollars": float(lock_profit_after),
+            "max_allowed_loss_per_trade_dollars": float(max_loss),
+            "exit_if_profitable_trade_turns_red": bool(exit_turn_red),
+            "exit_on_target_when_score_below": int(exit_score_below),
         })
         st.success("נשמר.")
+
+
+with tab_account:
+    st.subheader("🏦 חשבון דמו ומחזורים")
+    account = load_account()
+    trades = load_trades()
+    stats = summary_stats(trades)
+    balance = float(account.get("starting_balance", 10000.0)) + stats["net_total"]
+
+    c1, c2 = st.columns(2)
+    with c1:
+        starting_balance = st.number_input("יתרת פתיחה דמו ($)", 100.0, 10000000.0, float(account.get("starting_balance", 10000.0)), 100.0)
+        st.metric("יתרת חשבון דמו משוערת", fmt_money(balance))
+        st.metric("רווח כולל נטו", fmt_money(stats["net_total"]))
+
+    with c2:
+        st.metric("מחזורים שהושלמו", int(account.get("cycles_completed", 0)))
+        st.metric("רווח נעול במחזורים", fmt_money(account.get("locked_profit", 0.0)))
+        st.write("סגירת מחזור אחרונה:", account.get("last_cycle_closed_at", ""))
+        st.write("סיבה:", account.get("last_cycle_reason", ""))
+
+    a, b = st.columns(2)
+    with a:
+        if st.button("💾 שמור יתרת פתיחה", use_container_width=True):
+            account["starting_balance"] = float(starting_balance)
+            save_account(account)
+            st.success("נשמר.")
+    with b:
+        if st.button("♻️ אפס מחזורים בלבד", use_container_width=True):
+            account["cycles_completed"] = 0
+            account["locked_profit"] = 0.0
+            account["last_cycle_closed_at"] = ""
+            account["last_cycle_reason"] = ""
+            save_account(account)
+            st.success("המחזורים אופסו, העסקאות לא נמחקו.")
 
 
 with tab_help:
     st.subheader("📘 הסבר")
     st.markdown(
         """
-### מה חדש ב־V2?
+### מה חדש ב־V2/V3?
 
 **סיכום עליון**
 - רווח כולל נטו = רווח אחרי כל העלויות.
@@ -1290,5 +1608,26 @@ with tab_help:
 - מומנטום
 - ווליום
 - מבנה נרות
+
+### מה נוסף ב־V3?
+
+**זמן יציאה ומשך עסקה**  
+בכל עסקה סגורה מופיע זמן יציאה וגם משך העסקה בדקות.
+
+**סיבה ליציאה בעברית**  
+האפליקציה מציינת אם יצאנו בגלל סטופ לוס, סטופ רווח, יעד, יציאה מוקדמת, איזון אחרי עלויות או סגירת מחזור.
+
+**שינוי סטופ ידני**  
+בעסקאות פתוחות אפשר לפתוח את אזור הניהול ולשנות ידנית את הסטופ לעסקה מסוימת.
+
+**יעד מחזור 50$**  
+ברירת המחדל היא שאם המחזור הנוכחי מגיע ל־50$ רווח נטו, כל העסקאות הפתוחות נסגרות והמחזור נספר.
+
+**הגנת איזון אחרי עלויות**  
+אם עסקה הייתה ברווח ואז חוזרת לאיזור שבו אחרי עלויות אין רווח, האפליקציה יכולה לצאת כדי לא להפוך רווח להפסד.
+
+**מטרת האפליקציה**  
+לצמצם הפסדים, לקחת רווחים קטנים אחרי עלויות, ולתת לעסקאות חזקות להמשיך רק כאשר האינדיקטורים עדיין תומכים.
+
 """
     )

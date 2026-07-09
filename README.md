@@ -1,3 +1,3 @@
-# Paper Trading Lab V2
+# Paper Trading Lab V3
 
-Clean paper-trading-only app. Educational / demo only. Not investment advice.
+Paper trading only. Not investment advice.
