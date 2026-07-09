@@ -15,7 +15,7 @@ import plotly.graph_objects as go
 # App setup
 # ============================================================
 
-st.set_page_config(page_title="Paper Trading Lab V5", page_icon="🧪", layout="wide")
+st.set_page_config(page_title="Paper Trading Lab V5.1", page_icon="🧪", layout="wide")
 
 DATA_DIR = Path("paper_data")
 DATA_DIR.mkdir(exist_ok=True)
@@ -1669,7 +1669,7 @@ def render_closed_trades(closed_trades):
 st.markdown(
     """
 <div class="title-box">
-<h1>🧪 Paper Trading Lab V5</h1>
+<h1>🧪 Paper Trading Lab V5.1</h1>
 <p>אפליקציית Paper Trading נקייה: יעד מחזור 50$, סטופ ידני, סיבות יציאה, Break-even אחרי עלויות וצמצום הפסדים.</p>
 </div>
 """,
@@ -1697,6 +1697,8 @@ with tab_paper:
     render_summary(trades)
 
     st.markdown("---")
+
+    clear_pending_btn = False
 
     a, b, c, d = st.columns([1.4, 1.2, 1.1, 1.1])
 
@@ -1732,7 +1734,7 @@ with tab_paper:
         st.success("נוקה.")
         st.rerun()
 
-    if clear_pending_btn:
+    if "clear_pending_btn" in locals() and clear_pending_btn:
         clear_pending()
         st.success("המועמדות בהמתנה נוקו.")
         st.rerun()
