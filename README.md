@@ -1,3 +1,3 @@
-# Paper Trading Lab V5.1
+# Paper Trading Lab V5.2
 
-Fixes clear_pending_btn NameError. Paper trading only. Educational/demo only, not investment advice.
+Fixes StreamlitDuplicateElementId by adding unique widget keys. Paper trading only. Educational/demo only, not investment advice.

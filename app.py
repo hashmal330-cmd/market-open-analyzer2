@@ -15,7 +15,7 @@ import plotly.graph_objects as go
 # App setup
 # ============================================================
 
-st.set_page_config(page_title="Paper Trading Lab V5.1", page_icon="🧪", layout="wide")
+st.set_page_config(page_title="Paper Trading Lab V5.2", page_icon="🧪", layout="wide")
 
 DATA_DIR = Path("paper_data")
 DATA_DIR.mkdir(exist_ok=True)
@@ -1669,7 +1669,7 @@ def render_closed_trades(closed_trades):
 st.markdown(
     """
 <div class="title-box">
-<h1>🧪 Paper Trading Lab V5.1</h1>
+<h1>🧪 Paper Trading Lab V5.2</h1>
 <p>אפליקציית Paper Trading נקייה: יעד מחזור 50$, סטופ ידני, סיבות יציאה, Break-even אחרי עלויות וצמצום הפסדים.</p>
 </div>
 """,
@@ -1717,8 +1717,8 @@ with tab_paper:
     with b:
         modes = st.multiselect("סוג השקעה", ["מהירה", "חצי שעה"], default=["מהירה", "חצי שעה"])
         min_score = st.slider("מינימום ניקוד לפתיחה", 1, 8, 4)
-        max_new_now = st.number_input("כמה עסקאות חדשות לפתוח בסריקה", 1, 20, int(load_rules().get("max_new_trades_per_scan", 3)))
-        max_open_now = st.number_input("מקסימום עסקאות פתוחות במקביל", 1, 30, int(load_rules().get("max_open_trades", 6)))
+        max_new_now = st.number_input("כמה עסקאות חדשות לפתוח בסריקה", 1, 20, int(load_rules().get("max_new_trades_per_scan", 3)), key="paper_max_new_trades_now")
+        max_open_now = st.number_input("מקסימום עסקאות פתוחות במקביל", 1, 30, int(load_rules().get("max_open_trades", 6)), key="paper_max_open_trades_now")
 
     with c:
         run_scan = st.button("▶️ סרוק ופתח עסקאות", use_container_width=True)
@@ -1857,9 +1857,9 @@ with tab_rules:
         min_hold_fast = st.number_input("מינימום החזקה לעסקה מהירה, בדקות", 0, 60, int(rules["min_hold_fast_minutes"]))
         min_hold_half = st.number_input("מינימום החזקה לעסקת חצי שעה, בדקות", 0, 120, int(rules["min_hold_half_hour_minutes"]))
         cooldown = st.number_input("Cooldown אחרי סגירה, בדקות", 0, 120, int(rules["cooldown_after_close_minutes"]))
-        max_new = st.number_input("מקסימום עסקאות חדשות בכל סריקה", 1, 20, int(rules["max_new_trades_per_scan"]))
-        max_open_rule = st.number_input("מקסימום עסקאות פתוחות במקביל", 1, 30, int(rules.get("max_open_trades", 6)))
-        cycle_target = st.number_input("יעד רווח נטו למחזור ($)", 1.0, 10000.0, float(rules["cycle_net_profit_target"]), 1.0)
+        max_new = st.number_input("מקסימום עסקאות חדשות בכל סריקה", 1, 20, int(rules["max_new_trades_per_scan"]), key="rules_max_new_trades")
+        max_open_rule = st.number_input("מקסימום עסקאות פתוחות במקביל", 1, 30, int(rules.get("max_open_trades", 6)), key="rules_max_open_trades")
+        cycle_target = st.number_input("יעד רווח נטו למחזור ($)", 1.0, 10000.0, float(rules["cycle_net_profit_target"]), 1.0, key="rules_cycle_target")
 
     with r2:
         profit_r = st.number_input("כמה רווח R לפני הפעלת סטופ רווח", 0.1, 3.0, float(rules["min_profit_r_for_profit_stop"]), 0.05)
