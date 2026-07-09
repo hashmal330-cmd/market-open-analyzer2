@@ -1,3 +1,3 @@
-# Market Open Analyzer - Paper Trading Costs
+# Paper Trading Lab V2
 
-Educational Streamlit app. Not investment advice. Paper trading only, with cost model.
+Clean paper-trading-only app. Educational / demo only. Not investment advice.

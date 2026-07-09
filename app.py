@@ -1,3703 +1,1294 @@
+
+import json
 import time
+import uuid
 from pathlib import Path
-from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
 import streamlit as st
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import yfinance as yf
 
 
 # ============================================================
-# Page config
+# App setup
 # ============================================================
 
-st.set_page_config(
-    page_title="Market Open Analyzer - Free + Today Plan",
-    page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+st.set_page_config(page_title="Paper Trading Lab V2", page_icon="🧪", layout="wide")
 
-
-# ============================================================
-# Style
-# ============================================================
-
-CUSTOM_CSS = """
-<style>
-html, body, [class*="css"] {
-    direction: rtl;
-    text-align: right;
-    font-family: Arial, Helvetica, sans-serif;
-}
-.main-title {
-    font-size: 42px;
-    font-weight: 800;
-    margin-bottom: 0px;
-}
-.subtitle {
-    font-size: 18px;
-    color: #666;
-    margin-top: 0px;
-    margin-bottom: 24px;
-}
-.card {
-    padding: 18px;
-    border-radius: 18px;
-    background: linear-gradient(135deg, #f8fafc 0%, #eef2ff 100%);
-    border: 1px solid #e5e7eb;
-    box-shadow: 0px 8px 22px rgba(15, 23, 42, 0.06);
-    margin-bottom: 12px;
-}
-.warning-card {
-    padding: 16px;
-    border-radius: 16px;
-    background: #fff7ed;
-    border: 1px solid #fed7aa;
-    color: #7c2d12;
-    margin-bottom: 12px;
-}
-.good-card {
-    padding: 16px;
-    border-radius: 16px;
-    background: #ecfdf5;
-    border: 1px solid #bbf7d0;
-    color: #064e3b;
-    margin-bottom: 12px;
-}
-.small-muted {
-    color: #64748b;
-    font-size: 14px;
-}
-div[data-testid="stMetricValue"] {
-    direction: ltr;
-    text-align: center;
-}
-div[data-testid="stMetricLabel"] {
-    text-align: center;
-}
-</style>
-"""
-st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
-
-
-# ============================================================
-# Constants
-# ============================================================
-
-DEFAULT_TICKERS = {
-    "Apple": "AAPL",
-    "Nvidia": "NVDA",
-    "Tesla": "TSLA",
-    "Microsoft": "MSFT",
-    "Amazon": "AMZN",
-    "Meta": "META",
-    "Alphabet / Google": "GOOGL",
-    "AMD": "AMD",
-    "Micron": "MU",
-    "Netflix": "NFLX",
-    "Nasdaq-100 ETF": "QQQ",
-    "S&P 500 ETF": "SPY",
-    "S&P 500 ETF - Vanguard": "VOO",
-    "Nasdaq-100 ETF - QQQM": "QQQM",
-}
-
-DATA_DIR = Path("data")
+DATA_DIR = Path("paper_data")
 DATA_DIR.mkdir(exist_ok=True)
 
-CUSTOM_TICKERS_FILE = DATA_DIR / "custom_tickers.txt"
-
-
-def normalize_ticker(ticker: str) -> str:
-    """
-    Normalize a user-entered ticker.
-    Examples:
-    ' aapl ' -> 'AAPL'
-    'nasdaq:qqq' -> 'QQQ'
-    """
-    if ticker is None:
-        return ""
-    t = str(ticker).strip().upper()
-    if ":" in t:
-        t = t.split(":")[-1].strip()
-    t = t.replace(" ", "")
-    return t
-
-
-def load_custom_tickers() -> list[str]:
-    """
-    Load custom tickers saved by the user.
-    """
-    if not CUSTOM_TICKERS_FILE.exists():
-        return []
-
-    items = []
-    for line in CUSTOM_TICKERS_FILE.read_text(encoding="utf-8", errors="ignore").splitlines():
-        t = normalize_ticker(line)
-        if t:
-            items.append(t)
-
-    return sorted(set(items))
-
-
-def save_custom_ticker(ticker: str) -> bool:
-    """
-    Save a custom ticker to local file.
-    Returns True if added, False if it already existed or invalid.
-    """
-    t = normalize_ticker(ticker)
-    if not t:
-        return False
-
-    existing = set(load_custom_tickers())
-    built_in = set(DEFAULT_TICKERS.values())
-
-    if t in existing or t in built_in:
-        return False
-
-    existing.add(t)
-    CUSTOM_TICKERS_FILE.write_text("\n".join(sorted(existing)) + "\n", encoding="utf-8")
-    return True
-
-
-def get_all_ticker_options() -> dict[str, str]:
-    """
-    Merge default tickers with user-added custom tickers.
-    Keys are display names, values are ticker symbols.
-    """
-    options = dict(DEFAULT_TICKERS)
-    for t in load_custom_tickers():
-        options[f"Custom - {t}"] = t
-    return options
-
-
-
-
-@dataclass
-class AnalyzerConfig:
-    days_back: int = 59
-    bar_minutes: int = 5
-    first_window_minutes: int = 30
-    moderate_threshold_pct: float = 0.30
-    sharp_threshold_pct: float = 0.80
-    continuation_fraction: float = 0.50
-    retrace_fraction: float = 0.50
-    min_samples: int = 5
-
-
-# ============================================================
-# Data fetching: yfinance
-# ============================================================
-
-@st.cache_data(show_spinner=False, ttl=20)
-def fetch_intraday_yfinance(
-    ticker: str,
-    days_back: int,
-    interval_minutes: int,
-) -> pd.DataFrame:
-    """
-    Fetch recent intraday bars with yfinance.
-    yfinance intraday data is limited to recent history, so this app is for testing.
-    """
-
-    interval = f"{interval_minutes}m"
-
-    # Yahoo/yfinance usually limits 1-minute candles to a short recent window.
-    # To avoid download errors, the app automatically limits 1m to 7 days.
-    effective_days_back = int(days_back)
-    if int(interval_minutes) == 1:
-        effective_days_back = min(effective_days_back, 7)
-
-    period = f"{effective_days_back}d"
-
-    df = yf.download(
-        tickers=ticker,
-        period=period,
-        interval=interval,
-        auto_adjust=True,
-        prepost=False,
-        progress=False,
-        threads=False,
-    )
-
-    if df is None or df.empty:
-        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
-
-    # yfinance may return MultiIndex columns.
-    if isinstance(df.columns, pd.MultiIndex):
-        # Usually columns look like ("Close", "AAPL") or ("AAPL", "Close").
-        try:
-            if ticker in df.columns.get_level_values(0):
-                df = df[ticker]
-            elif ticker in df.columns.get_level_values(1):
-                df = df.xs(ticker, axis=1, level=1)
-            else:
-                df.columns = df.columns.get_level_values(-1)
-        except Exception:
-            df.columns = df.columns.get_level_values(-1)
-
-    rename_map = {
-        "Open": "open",
-        "High": "high",
-        "Low": "low",
-        "Close": "close",
-        "Adj Close": "adj_close",
-        "Volume": "volume",
-    }
-    df = df.rename(columns=rename_map)
-
-    needed = ["open", "high", "low", "close", "volume"]
-    missing = [c for c in needed if c not in df.columns]
-    if missing:
-        raise RuntimeError(f"Missing columns from yfinance data: {missing}")
-
-    df = df[needed].dropna()
-
-    # Make sure timezone is America/New_York.
-    if df.index.tz is None:
-        df.index = df.index.tz_localize("America/New_York")
-    else:
-        df.index = df.index.tz_convert("America/New_York")
-
-    df = df.sort_index()
-    return df
-
-
-# ============================================================
-# Market hours
-# ============================================================
-
-def filter_regular_market_hours(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-    return df.between_time("09:30", "15:59")
-
-
-def get_latest_trading_day(df: pd.DataFrame) -> pd.DataFrame:
-    df = filter_regular_market_hours(df)
-    if df.empty:
-        return df
-    last_day = max(df.index.date)
-    return df[df.index.date == last_day]
-
-
-# ============================================================
-# Classification logic
-# ============================================================
-
-def classify_opening_magnitude(initial_move_pct: float, cfg: AnalyzerConfig) -> str:
-    if initial_move_pct >= cfg.sharp_threshold_pct:
-        return "sharp_up"
-    if initial_move_pct >= cfg.moderate_threshold_pct:
-        return "moderate_up"
-    if initial_move_pct <= -cfg.sharp_threshold_pct:
-        return "sharp_down"
-    if initial_move_pct <= -cfg.moderate_threshold_pct:
-        return "moderate_down"
-    return "flat_open"
-
-
-def classify_opening_shape(first_window: pd.DataFrame) -> str:
-    if first_window.empty:
-        return "unknown"
-
-    open_price = float(first_window.iloc[0]["open"])
-    close_price = float(first_window.iloc[-1]["close"])
-    high_price = float(first_window["high"].max())
-    low_price = float(first_window["low"].min())
-
-    total_range = high_price - low_price
-    if total_range <= 0:
-        return "quiet_flat"
-
-    body = close_price - open_price
-    body_abs = abs(body)
-    efficiency = body_abs / total_range
-    close_location = (close_price - low_price) / total_range
-    range_pct = (total_range / open_price) * 100
-    move_pct = (close_price / open_price - 1) * 100
-
-    if abs(move_pct) < 0.30:
-        if range_pct >= 0.80:
-            return "volatile_chop"
-        return "quiet_flat"
-
-    if close_price > open_price:
-        if efficiency >= 0.60 and close_location >= 0.75:
-            return "clean_up"
-        if close_location <= 0.55:
-            return "up_rejected"
-        return "choppy_up"
-
-    if close_price < open_price:
-        if efficiency >= 0.60 and close_location <= 0.25:
-            return "clean_down"
-        if close_location >= 0.45:
-            return "down_rejected"
-        return "choppy_down"
-
-    return "unknown"
-
-
-def classify_volume_relative(results: pd.DataFrame) -> pd.DataFrame:
-    if results.empty or "opening_volume" not in results.columns:
-        return results
-
-    avg_volume = results["opening_volume"].mean()
-
-    if avg_volume <= 0 or pd.isna(avg_volume):
-        results["opening_volume_class"] = "unknown_volume"
-        return results
-
-    def classify(v):
-        if v >= avg_volume * 1.30:
-            return "high_volume"
-        if v <= avg_volume * 0.70:
-            return "low_volume"
-        return "normal_volume"
-
-    results["opening_volume_class"] = results["opening_volume"].apply(classify)
-    return results
-
-
-# ============================================================
-# Day analysis
-# ============================================================
-
-def analyze_single_day(day_df: pd.DataFrame, cfg: AnalyzerConfig) -> dict | None:
-    if day_df.empty:
-        return None
-
-    day_df = day_df.sort_index()
-
-    market_open_price = float(day_df.iloc[0]["open"])
-    first_window_end = day_df.index[0] + pd.Timedelta(minutes=cfg.first_window_minutes)
-
-    first_window = day_df[day_df.index < first_window_end]
-    after_window = day_df[day_df.index >= first_window_end]
-
-    if first_window.empty or after_window.empty:
-        return None
-
-    first_window_close = float(first_window.iloc[-1]["close"])
-    initial_move_pct = (first_window_close / market_open_price - 1) * 100
-
-    day_close = float(day_df.iloc[-1]["close"])
-    day_high = float(day_df["high"].max())
-    day_low = float(day_df["low"].min())
-
-    opening_magnitude = classify_opening_magnitude(initial_move_pct, cfg)
-    opening_shape = classify_opening_shape(first_window)
-    opening_type = f"{opening_magnitude}_{opening_shape}"
-    opening_volume = float(first_window["volume"].sum())
-
-    result = {
-        "date": str(day_df.index[0].date()),
-        "open": market_open_price,
-        "first_window_close": first_window_close,
-        "initial_move_pct": initial_move_pct,
-        "opening_magnitude": opening_magnitude,
-        "opening_shape": opening_shape,
-        "opening_type": opening_type,
-        "opening_volume": opening_volume,
-        "day_close": day_close,
-        "day_high": day_high,
-        "day_low": day_low,
-        "eod_change_pct": (day_close / market_open_price - 1) * 100,
-    }
-
-    if initial_move_pct > 0:
-        first_move_points = first_window_close - market_open_price
-        continuation_level = first_window_close + cfg.continuation_fraction * first_move_points
-        retrace_level = market_open_price + (1 - cfg.retrace_fraction) * first_move_points
-
-        continuation_hits = after_window[after_window["high"] >= continuation_level]
-        retrace_hits = after_window[after_window["low"] <= retrace_level]
-
-        continuation_time = continuation_hits.index.min() if not continuation_hits.empty else None
-        retrace_time = retrace_hits.index.min() if not retrace_hits.empty else None
-
-        result["continuation_level"] = continuation_level
-        result["retrace_half_level"] = retrace_level
-
-        if continuation_time is not None and retrace_time is not None:
-            if continuation_time < retrace_time:
-                result["after_result"] = "continued_first"
-            elif retrace_time < continuation_time:
-                result["after_result"] = "half_retrace_first"
-            else:
-                result["after_result"] = "both_same_bar_unknown_order"
-        elif continuation_time is not None:
-            result["after_result"] = "continued_only"
-        elif retrace_time is not None:
-            result["after_result"] = "half_retrace_only"
-        else:
-            result["after_result"] = "range_no_clear_move"
-
-    elif initial_move_pct < 0:
-        first_move_points = market_open_price - first_window_close
-        continuation_level = first_window_close - cfg.continuation_fraction * first_move_points
-        retrace_level = market_open_price - (1 - cfg.retrace_fraction) * first_move_points
-
-        continuation_hits = after_window[after_window["low"] <= continuation_level]
-        retrace_hits = after_window[after_window["high"] >= retrace_level]
-
-        continuation_time = continuation_hits.index.min() if not continuation_hits.empty else None
-        retrace_time = retrace_hits.index.min() if not retrace_hits.empty else None
-
-        result["continuation_level"] = continuation_level
-        result["retrace_half_level"] = retrace_level
-
-        if continuation_time is not None and retrace_time is not None:
-            if continuation_time < retrace_time:
-                result["after_result"] = "continued_down_first"
-            elif retrace_time < continuation_time:
-                result["after_result"] = "half_rebound_first"
-            else:
-                result["after_result"] = "both_same_bar_unknown_order"
-        elif continuation_time is not None:
-            result["after_result"] = "continued_down_only"
-        elif retrace_time is not None:
-            result["after_result"] = "half_rebound_only"
-        else:
-            result["after_result"] = "range_no_clear_move"
-    else:
-        result["after_result"] = "not_tested"
-
-    return result
-
-
-def analyze_history(df: pd.DataFrame, cfg: AnalyzerConfig) -> pd.DataFrame:
-    df = filter_regular_market_hours(df)
-
-    if df.empty:
-        return pd.DataFrame()
-
-    rows = []
-    for _, day_df in df.groupby(df.index.date):
-        analyzed = analyze_single_day(day_df, cfg)
-        if analyzed is not None:
-            rows.append(analyzed)
-
-    results = pd.DataFrame(rows)
-
-    if not results.empty:
-        results = classify_volume_relative(results)
-        results["opening_type_with_volume"] = (
-            results["opening_type"] + "_" + results["opening_volume_class"]
-        )
-
-    return results
-
-
-# ============================================================
-# Summaries
-# ============================================================
-
-def probability_summary_by_opening_type(results: pd.DataFrame, min_samples: int = 5) -> pd.DataFrame:
-    if results.empty:
-        return pd.DataFrame()
-
-    counts_per_type = results.groupby("opening_type").size().reset_index(name="total_cases")
-
-    summary = (
-        results.groupby(["opening_type", "after_result"])
-        .size()
-        .reset_index(name="count")
-    )
-
-    summary = summary.merge(counts_per_type, on="opening_type", how="left")
-    summary = summary[summary["total_cases"] >= min_samples].copy()
-
-    if summary.empty:
-        return summary
-
-    summary["probability_pct"] = summary["count"] / summary["total_cases"] * 100
-    summary = summary.sort_values(["opening_type", "probability_pct"], ascending=[True, False])
-    return summary
-
-
-def probability_summary_by_type_and_volume(results: pd.DataFrame, min_samples: int = 5) -> pd.DataFrame:
-    if results.empty or "opening_type_with_volume" not in results.columns:
-        return pd.DataFrame()
-
-    counts_per_type = (
-        results.groupby("opening_type_with_volume")
-        .size()
-        .reset_index(name="total_cases")
-    )
-
-    summary = (
-        results.groupby(["opening_type_with_volume", "after_result"])
-        .size()
-        .reset_index(name="count")
-    )
-
-    summary = summary.merge(counts_per_type, on="opening_type_with_volume", how="left")
-    summary = summary[summary["total_cases"] >= min_samples].copy()
-
-    if summary.empty:
-        return summary
-
-    summary["probability_pct"] = summary["count"] / summary["total_cases"] * 100
-    summary = summary.sort_values(
-        ["opening_type_with_volume", "probability_pct"],
-        ascending=[True, False],
-    )
-    return summary
-
-
-def eod_summary_by_opening_type(results: pd.DataFrame, min_samples: int = 5) -> pd.DataFrame:
-    if results.empty:
-        return pd.DataFrame()
-
-    grouped = results.groupby("opening_type")
-
-    summary = grouped.agg(
-        total_cases=("opening_type", "size"),
-        avg_eod_change_pct=("eod_change_pct", "mean"),
-        median_eod_change_pct=("eod_change_pct", "median"),
-        win_rate_eod_green=("eod_change_pct", lambda s: (s > 0).mean() * 100),
-        avg_initial_move_pct=("initial_move_pct", "mean"),
-    ).reset_index()
-
-    summary = summary[summary["total_cases"] >= min_samples].copy()
-    summary = summary.sort_values("total_cases", ascending=False)
-    return summary
-
-
-# ============================================================
-# Current day
-# ============================================================
-
-def classify_current_opening(latest_day_df: pd.DataFrame, cfg: AnalyzerConfig) -> dict | None:
-    latest_day_df = filter_regular_market_hours(latest_day_df)
-
-    if latest_day_df.empty:
-        return None
-
-    latest_day_df = latest_day_df.sort_index()
-
-    market_open_price = float(latest_day_df.iloc[0]["open"])
-    current_price = float(latest_day_df.iloc[-1]["close"])
-    current_time = latest_day_df.index[-1]
-
-    first_window_end = latest_day_df.index[0] + pd.Timedelta(minutes=cfg.first_window_minutes)
-    first_window = latest_day_df[latest_day_df.index < first_window_end]
-
-    if first_window.empty:
-        return None
-
-    first_window_close = float(first_window.iloc[-1]["close"])
-
-    initial_move_pct = (first_window_close / market_open_price - 1) * 100
-    current_move_pct = (current_price / market_open_price - 1) * 100
-
-    opening_magnitude = classify_opening_magnitude(initial_move_pct, cfg)
-    opening_shape = classify_opening_shape(first_window)
-    opening_type = f"{opening_magnitude}_{opening_shape}"
-
-    expected_bars = max(1, int(cfg.first_window_minutes / cfg.bar_minutes))
-    bars_count = len(first_window)
-    is_complete_window = bars_count >= expected_bars
-
-    return {
-        "date": str(latest_day_df.index[0].date()),
-        "current_time": str(current_time),
-        "open_price": market_open_price,
-        "current_price": current_price,
-        "first_window_close": first_window_close,
-        "initial_move_pct": initial_move_pct,
-        "current_move_pct": current_move_pct,
-        "opening_magnitude": opening_magnitude,
-        "opening_shape": opening_shape,
-        "opening_type": opening_type,
-        "opening_volume": float(first_window["volume"].sum()),
-        "bars_count": bars_count,
-        "expected_bars": expected_bars,
-        "is_complete_window": is_complete_window,
-    }
-
-
-def compare_current_to_history(current_info: dict, summary_by_type: pd.DataFrame) -> pd.DataFrame:
-    if current_info is None or summary_by_type.empty:
-        return pd.DataFrame()
-
-    opening_type = current_info["opening_type"]
-    match = summary_by_type[summary_by_type["opening_type"] == opening_type].copy()
-
-    if match.empty:
-        return pd.DataFrame()
-
-    return match.sort_values("probability_pct", ascending=False)
-
-
-# ============================================================
-# Today status + educational trade plan
-# ============================================================
-
-def build_today_status(latest_day_df: pd.DataFrame, cfg: AnalyzerConfig) -> dict | None:
-    """
-    Summarizes what actually happened today / latest trading day.
-    This is descriptive only, not a trading recommendation.
-    """
-
-    day_df = filter_regular_market_hours(latest_day_df)
-
-    if day_df.empty:
-        return None
-
-    day_df = day_df.sort_index()
-
-    open_price = float(day_df.iloc[0]["open"])
-    current_price = float(day_df.iloc[-1]["close"])
-    day_high = float(day_df["high"].max())
-    day_low = float(day_df["low"].min())
-    day_volume = float(day_df["volume"].sum())
-
-    first_window_end = day_df.index[0] + pd.Timedelta(minutes=cfg.first_window_minutes)
-    first_window = day_df[day_df.index < first_window_end]
-    after_window = day_df[day_df.index >= first_window_end]
-
-    if first_window.empty:
-        return None
-
-    first_open = float(first_window.iloc[0]["open"])
-    first_close = float(first_window.iloc[-1]["close"])
-    first_high = float(first_window["high"].max())
-    first_low = float(first_window["low"].min())
-    first_mid = (first_high + first_low) / 2
-
-    initial_move_pct = (first_close / first_open - 1) * 100
-    current_move_pct = (current_price / open_price - 1) * 100
-
-    day_range = day_high - day_low
-    if day_range > 0:
-        current_position_in_range_pct = (current_price - day_low) / day_range * 100
-    else:
-        current_position_in_range_pct = np.nan
-
-    opening_direction = "up" if initial_move_pct > 0 else "down" if initial_move_pct < 0 else "flat"
-
-    continuation_level = np.nan
-    retrace_half_level = np.nan
-    continuation_hit = False
-    retrace_half_hit = False
-    today_after_status = "not_enough_data_after_opening_window"
-
-    if not after_window.empty and initial_move_pct > 0:
-        first_move_points = first_close - first_open
-        continuation_level = first_close + cfg.continuation_fraction * first_move_points
-        retrace_half_level = first_open + (1 - cfg.retrace_fraction) * first_move_points
-
-        continuation_hits = after_window[after_window["high"] >= continuation_level]
-        retrace_hits = after_window[after_window["low"] <= retrace_half_level]
-
-        continuation_time = continuation_hits.index.min() if not continuation_hits.empty else None
-        retrace_time = retrace_hits.index.min() if not retrace_hits.empty else None
-
-        continuation_hit = continuation_time is not None
-        retrace_half_hit = retrace_time is not None
-
-        if continuation_time is not None and retrace_time is not None:
-            if continuation_time < retrace_time:
-                today_after_status = "continued_first_today"
-            elif retrace_time < continuation_time:
-                today_after_status = "half_retrace_first_today"
-            else:
-                today_after_status = "both_same_bar_unknown_order_today"
-        elif continuation_time is not None:
-            today_after_status = "continued_only_today"
-        elif retrace_time is not None:
-            today_after_status = "half_retrace_only_today"
-        else:
-            today_after_status = "no_clear_followthrough_yet"
-
-    elif not after_window.empty and initial_move_pct < 0:
-        first_move_points = first_open - first_close
-        continuation_level = first_close - cfg.continuation_fraction * first_move_points
-        retrace_half_level = first_open - (1 - cfg.retrace_fraction) * first_move_points
-
-        continuation_hits = after_window[after_window["low"] <= continuation_level]
-        retrace_hits = after_window[after_window["high"] >= retrace_half_level]
-
-        continuation_time = continuation_hits.index.min() if not continuation_hits.empty else None
-        retrace_time = retrace_hits.index.min() if not retrace_hits.empty else None
-
-        continuation_hit = continuation_time is not None
-        retrace_half_hit = retrace_time is not None
-
-        if continuation_time is not None and retrace_time is not None:
-            if continuation_time < retrace_time:
-                today_after_status = "continued_down_first_today"
-            elif retrace_time < continuation_time:
-                today_after_status = "half_rebound_first_today"
-            else:
-                today_after_status = "both_same_bar_unknown_order_today"
-        elif continuation_time is not None:
-            today_after_status = "continued_down_only_today"
-        elif retrace_time is not None:
-            today_after_status = "half_rebound_only_today"
-        else:
-            today_after_status = "no_clear_followthrough_yet"
-
-    return {
-        "date": str(day_df.index[0].date()),
-        "last_bar_time": str(day_df.index[-1]),
-        "open_price": open_price,
-        "current_price": current_price,
-        "current_move_pct": current_move_pct,
-        "day_high": day_high,
-        "day_low": day_low,
-        "day_volume": day_volume,
-        "first_window_open": first_open,
-        "first_window_close": first_close,
-        "first_window_high": first_high,
-        "first_window_low": first_low,
-        "first_window_mid": first_mid,
-        "initial_move_pct": initial_move_pct,
-        "opening_direction": opening_direction,
-        "current_position_in_range_pct": current_position_in_range_pct,
-        "continuation_level": continuation_level,
-        "retrace_half_level": retrace_half_level,
-        "continuation_hit": continuation_hit,
-        "retrace_half_hit": retrace_half_hit,
-        "today_after_status": today_after_status,
-    }
-
-
-def _probability_from_match(match: pd.DataFrame, keys: list[str]) -> float:
-    if match is None or match.empty:
-        return 0.0
-    filtered = match[match["after_result"].isin(keys)]
-    if filtered.empty:
-        return 0.0
-    return float(filtered["probability_pct"].sum())
-
-
-def build_educational_trade_plan(
-    current_info: dict,
-    today_status: dict,
-    match: pd.DataFrame,
-    cfg: AnalyzerConfig,
-) -> dict:
-    """
-    Builds a rule-based educational scenario.
-    It intentionally avoids saying 'buy/sell now'.
-    """
-
-    no_trade = {
-        "bias": "NO_TRADE",
-        "title_he": "אין עסקה נקייה כרגע",
-        "direction_he": "להמתין",
-        "confidence_he": "נמוכה",
-        "entry_zone": "אין כניסה",
-        "trigger": "להמתין לאישור מחיר ברור",
-        "stop": "לא רלוונטי",
-        "target_1": "לא רלוונטי",
-        "target_2": "לא רלוונטי",
-        "time_plan": "לא להחזיק עסקה בלי תוכנית מסודרת",
-        "reason": "אין מספיק נתונים או שאין יתרון סטטיסטי ברור.",
-        "long_probability": 0.0,
-        "short_probability": 0.0,
-        "edge_points": 0.0,
-    }
-
-    if current_info is None or today_status is None:
-        return no_trade
-
-    if not current_info.get("is_complete_window", False):
-        out = no_trade.copy()
-        out["reason"] = "חלון הפתיחה עדיין לא הושלם. עדיף להמתין עד שיש מספיק נרות."
-        return out
-
-    if match is None or match.empty:
-        out = no_trade.copy()
-        out["reason"] = "אין מספיק היסטוריה לסוג הפתיחה הנוכחי."
-        return out
-
-    opening_direction = today_status["opening_direction"]
-    first_high = float(today_status["first_window_high"])
-    first_low = float(today_status["first_window_low"])
-    first_mid = float(today_status["first_window_mid"])
-    current_price = float(today_status["current_price"])
-
-    opening_range = max(first_high - first_low, current_price * 0.001)
-    buffer_value = current_price * 0.0005
-
-    if opening_direction == "up":
-        long_prob = _probability_from_match(match, ["continued_first", "continued_only"])
-        short_prob = _probability_from_match(match, ["half_retrace_first", "half_retrace_only"])
-    elif opening_direction == "down":
-        short_prob = _probability_from_match(match, ["continued_down_first", "continued_down_only"])
-        long_prob = _probability_from_match(match, ["half_rebound_first", "half_rebound_only"])
-    else:
-        long_prob = 0.0
-        short_prob = 0.0
-
-    edge = abs(long_prob - short_prob)
-
-    # We require a clear edge. Otherwise no trade.
-    if max(long_prob, short_prob) < 50 or edge < 12:
-        out = no_trade.copy()
-        out["reason"] = (
-            f"אין יתרון מספיק ברור: הסתברות לונג {long_prob:.1f}% מול שורט {short_prob:.1f}%."
-        )
-        out["long_probability"] = long_prob
-        out["short_probability"] = short_prob
-        out["edge_points"] = edge
-        return out
-
-    if long_prob > short_prob:
-        entry_low = first_high
-        entry_high = first_high + buffer_value
-        stop_price = min(first_mid, first_low - buffer_value)
-        risk = max(entry_high - stop_price, opening_range * 0.35)
-        target_1 = entry_high + risk
-        target_2 = entry_high + 2 * risk
-
-        return {
-            "bias": "LONG_WATCH",
-            "title_he": "תרחיש לימודי: לונג רק אם יש פריצה/ריטסט",
-            "direction_he": "לונג",
-            "confidence_he": "בינונית" if edge < 25 else "גבוהה יחסית",
-            "entry_zone": f"{entry_low:.2f} עד {entry_high:.2f}",
-            "trigger": "כניסה רק אם המחיר פורץ מעל הגבוה של חלון הפתיחה או חוזר לבדוק אותו ומחזיק מעליו.",
-            "stop": f"מתחת לאמצע/נמוך חלון הפתיחה: בערך {stop_price:.2f}",
-            "target_1": f"יעד 1R: בערך {target_1:.2f}",
-            "target_2": f"יעד 2R: בערך {target_2:.2f}",
-            "time_plan": "עסקת intraday בלבד: לבדוק 30-120 דקות אחרי הטריגר או לסגור לפני סוף המסחר.",
-            "reason": f"לפי מקרים דומים: המשך למעלה {long_prob:.1f}% מול תיקון/שורט {short_prob:.1f}%.",
-            "long_probability": long_prob,
-            "short_probability": short_prob,
-            "edge_points": edge,
-        }
-
-    entry_high = first_low
-    entry_low = first_low - buffer_value
-    stop_price = max(first_mid, first_high + buffer_value)
-    risk = max(stop_price - entry_low, opening_range * 0.35)
-    target_1 = entry_low - risk
-    target_2 = entry_low - 2 * risk
-
-    return {
-        "bias": "SHORT_WATCH",
-        "title_he": "תרחיש לימודי: שורט רק אם יש שבירה/ריטסט",
-        "direction_he": "שורט",
-        "confidence_he": "בינונית" if edge < 25 else "גבוהה יחסית",
-        "entry_zone": f"{entry_low:.2f} עד {entry_high:.2f}",
-        "trigger": "כניסה רק אם המחיר שובר מתחת לנמוך של חלון הפתיחה או חוזר לבדוק אותו מלמטה ונכשל.",
-        "stop": f"מעל האמצע/גבוה חלון הפתיחה: בערך {stop_price:.2f}",
-        "target_1": f"יעד 1R: בערך {target_1:.2f}",
-        "target_2": f"יעד 2R: בערך {target_2:.2f}",
-        "time_plan": "עסקת intraday בלבד: לבדוק 30-120 דקות אחרי הטריגר או לסגור לפני סוף המסחר.",
-        "reason": f"לפי מקרים דומים: המשך/שורט {short_prob:.1f}% מול לונג/תיקון {long_prob:.1f}%.",
-        "long_probability": long_prob,
-        "short_probability": short_prob,
-        "edge_points": edge,
-    }
-
-
-
-# ============================================================
-# Invest now / current moment educational scenario
-# ============================================================
-
-def add_realtime_indicators(day_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Adds intraday indicators:
-    EMA20, EMA50, VWAP, RSI14, MACD, Bollinger Bands,
-    relative volume, ATR-like range and day-range position.
-    """
-
-    df = filter_regular_market_hours(day_df).copy()
-
-    if df.empty:
-        return df
-
-    df = df.sort_index()
-
-    # Trend / mean indicators
-    df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
-    df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
-
-    typical_price = (df["high"] + df["low"] + df["close"]) / 3
-    cumulative_pv = (typical_price * df["volume"]).cumsum()
-    cumulative_volume = df["volume"].replace(0, np.nan).cumsum()
-    df["vwap"] = cumulative_pv / cumulative_volume
-
-    # RSI 14
-    delta = df["close"].diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
-    avg_loss = loss.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    df["rsi14"] = 100 - (100 / (1 + rs))
-
-    # MACD 12/26/9
-    ema12 = df["close"].ewm(span=12, adjust=False).mean()
-    ema26 = df["close"].ewm(span=26, adjust=False).mean()
-    df["macd"] = ema12 - ema26
-    df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
-    df["macd_hist"] = df["macd"] - df["macd_signal"]
-
-    # Bollinger Bands 20, 2 std
-    bb_mid = df["close"].rolling(20, min_periods=20).mean()
-    bb_std = df["close"].rolling(20, min_periods=20).std()
-    df["bb_mid"] = bb_mid
-    df["bb_upper"] = bb_mid + 2 * bb_std
-    df["bb_lower"] = bb_mid - 2 * bb_std
-    df["bb_width_pct"] = ((df["bb_upper"] - df["bb_lower"]) / df["bb_mid"]) * 100
-    df["bb_position"] = (df["close"] - df["bb_lower"]) / (df["bb_upper"] - df["bb_lower"])
-
-    # Volume quality
-    df["volume_ma20"] = df["volume"].rolling(20, min_periods=5).mean()
-    df["relative_volume"] = df["volume"] / df["volume_ma20"].replace(0, np.nan)
-
-    # ATR-like intraday range
-    df["bar_range"] = df["high"] - df["low"]
-    df["atr_like"] = df["bar_range"].rolling(14, min_periods=3).mean()
-
-    # Day position
-    day_high_expanding = df["high"].expanding().max()
-    day_low_expanding = df["low"].expanding().min()
-    df["day_range_position"] = (df["close"] - day_low_expanding) / (day_high_expanding - day_low_expanding).replace(0, np.nan)
-
-    return df
-
-
-def _safe_float(value, default=np.nan) -> float:
-    try:
-        if pd.isna(value):
-            return float(default)
-        return float(value)
-    except Exception:
-        return float(default)
-
-
-def build_invest_now_plan(latest_day_df: pd.DataFrame, cfg: AnalyzerConfig) -> dict:
-    """
-    Builds a rules-based educational current-moment scenario.
-
-    This is not investment advice and not a buy/sell instruction.
-    It is a structured paper-trading scenario using current available data.
-    """
-
-    df = add_realtime_indicators(latest_day_df)
-
-    base = {
-        "bias": "NO_TRADE",
-        "title_he": "אין עסקה נקייה עכשיו",
-        "direction_he": "להמתין",
-        "confidence_he": "נמוכה",
-        "setup_score": 0,
-        "setup_quality": "חלש",
-        "current_price": np.nan,
-        "current_time": "",
-        "trend_state": "לא ידוע",
-        "entry_zone": "אין כניסה",
-        "trigger": "להמתין לאישור מחיר ברור",
-        "stop": "לא רלוונטי",
-        "target_1": "לא רלוונטי",
-        "target_2": "לא רלוונטי",
-        "time_plan": "לא להחזיק עסקה בלי תוכנית מסודרת.",
-        "reason": "אין מספיק נתונים או שהשוק לא בכיוון ברור.",
-        "filters_summary": "",
-        "risk_reward": "לא רלוונטי",
-        "distance_from_vwap_pct": np.nan,
-        "distance_from_ema20_pct": np.nan,
-        "ema20": np.nan,
-        "ema50": np.nan,
-        "vwap": np.nan,
-        "rsi14": np.nan,
-        "macd_hist": np.nan,
-        "relative_volume": np.nan,
-        "bb_position": np.nan,
-        "bb_width_pct": np.nan,
-        "day_range_position": np.nan,
-        "atr_like": np.nan,
-        "day_open": np.nan,
-        "day_high": np.nan,
-        "day_low": np.nan,
-        "current_move_pct": np.nan,
-    }
-
-    if df.empty or len(df) < 30:
-        out = base.copy()
-        out["reason"] = "אין מספיק נרות היום כדי לבנות תרחיש סביר. צריך לפחות 30 נרות."
-        return out
-
-    last = df.iloc[-1]
-    prev = df.iloc[-2] if len(df) >= 2 else last
-
-    current_price = _safe_float(last["close"])
-    current_time = str(df.index[-1])
-    ema20 = _safe_float(last["ema20"])
-    ema50 = _safe_float(last["ema50"])
-    vwap = _safe_float(last["vwap"])
-    rsi14 = _safe_float(last["rsi14"])
-    macd_hist = _safe_float(last["macd_hist"])
-    prev_macd_hist = _safe_float(prev["macd_hist"])
-    relative_volume = _safe_float(last["relative_volume"])
-    bb_position = _safe_float(last["bb_position"])
-    bb_width_pct = _safe_float(last["bb_width_pct"])
-    day_range_position = _safe_float(last["day_range_position"])
-    atr_like = _safe_float(last["atr_like"], current_price * 0.003)
-
-    day_open = _safe_float(df.iloc[0]["open"])
-    day_high = _safe_float(df["high"].max())
-    day_low = _safe_float(df["low"].min())
-    current_move_pct = (current_price / day_open - 1) * 100 if day_open > 0 else np.nan
-
-    last_10_high = _safe_float(df["high"].tail(10).max())
-    last_10_low = _safe_float(df["low"].tail(10).min())
-    last_20_high = _safe_float(df["high"].tail(20).max())
-    last_20_low = _safe_float(df["low"].tail(20).min())
-
-    prev_high = _safe_float(prev["high"])
-    prev_low = _safe_float(prev["low"])
-
-    distance_from_vwap_pct = (current_price / vwap - 1) * 100 if vwap > 0 else np.nan
-    distance_from_ema20_pct = (current_price / ema20 - 1) * 100 if ema20 > 0 else np.nan
-
-    # Build confluence score. Positive = long bias, negative = short bias.
-    score = 0
-    filters = []
-
-    if current_price > vwap:
-        score += 1
-        filters.append("מחיר מעל VWAP")
-    elif current_price < vwap:
-        score -= 1
-        filters.append("מחיר מתחת VWAP")
-
-    if current_price > ema20 > ema50:
-        score += 2
-        filters.append("EMA20 מעל EMA50 והמחיר מעליהם")
-    elif current_price < ema20 < ema50:
-        score -= 2
-        filters.append("EMA20 מתחת EMA50 והמחיר מתחתיהם")
-    elif current_price > ema20:
-        score += 1
-        filters.append("מחיר מעל EMA20")
-    elif current_price < ema20:
-        score -= 1
-        filters.append("מחיר מתחת EMA20")
-
-    if pd.notna(rsi14):
-        if 45 <= rsi14 <= 68:
-            score += 1
-            filters.append("RSI תומך בלונג ללא קניות יתר קיצוניות")
-        elif 32 <= rsi14 <= 55:
-            score -= 1
-            filters.append("RSI תומך בשורט ללא מכירות יתר קיצוניות")
-        elif rsi14 > 75:
-            score -= 1
-            filters.append("RSI גבוה מדי — חשש לרדיפה בלונג")
-        elif rsi14 < 25:
-            score += 1
-            filters.append("RSI נמוך מדי — חשש לרדיפה בשורט")
-
-    if pd.notna(macd_hist):
-        if macd_hist > 0 and macd_hist >= prev_macd_hist:
-            score += 1
-            filters.append("MACD histogram חיובי ומתחזק")
-        elif macd_hist < 0 and macd_hist <= prev_macd_hist:
-            score -= 1
-            filters.append("MACD histogram שלילי ומתחזק למטה")
-
-    if pd.notna(relative_volume):
-        if relative_volume >= 1.20:
-            filters.append("ווליום יחסי גבוה — התנועה משמעותית יותר")
-        elif relative_volume < 0.70:
-            filters.append("ווליום יחסי נמוך — אמינות התנועה חלשה יותר")
-            if score > 0:
-                score -= 1
-            elif score < 0:
-                score += 1
-
-    if pd.notna(day_range_position):
-        if day_range_position >= 0.70:
-            score += 1
-            filters.append("המחיר בחלק העליון של הטווח היומי")
-        elif day_range_position <= 0.30:
-            score -= 1
-            filters.append("המחיר בחלק התחתון של הטווח היומי")
-        else:
-            filters.append("המחיר באמצע הטווח — פחות חד")
-
-    # Over-extension protection
-    too_extended_long = (
-        pd.notna(distance_from_ema20_pct)
-        and pd.notna(distance_from_vwap_pct)
-        and distance_from_ema20_pct > 1.20
-        and distance_from_vwap_pct > 1.50
-    )
-    too_extended_short = (
-        pd.notna(distance_from_ema20_pct)
-        and pd.notna(distance_from_vwap_pct)
-        and distance_from_ema20_pct < -1.20
-        and distance_from_vwap_pct < -1.50
-    )
-
-    if too_extended_long:
-        score -= 1
-        filters.append("המחיר מתוח מדי מעל EMA/VWAP — עדיף לא לרדוף")
-    if too_extended_short:
-        score += 1
-        filters.append("המחיר מתוח מדי מתחת EMA/VWAP — עדיף לא לרדוף")
-
-    if score >= 5:
-        setup_quality = "חזק"
-        confidence_he = "גבוהה יחסית"
-    elif score >= 3:
-        setup_quality = "בינוני"
-        confidence_he = "בינונית"
-    elif score <= -5:
-        setup_quality = "חזק"
-        confidence_he = "גבוהה יחסית"
-    elif score <= -3:
-        setup_quality = "בינוני"
-        confidence_he = "בינונית"
-    else:
-        setup_quality = "חלש / מעורב"
-        confidence_he = "נמוכה"
-
-    buffer_value = max(current_price * 0.0005, atr_like * 0.10)
-    min_risk = max(current_price * 0.0015, atr_like * 0.50)
-
-    bullish_structure = score >= 3 and current_price > ema20 and current_price > vwap
-    bearish_structure = score <= -3 and current_price < ema20 and current_price < vwap
-
-    common_values = {
-        "setup_score": int(score),
-        "setup_quality": setup_quality,
-        "confidence_he": confidence_he,
-        "current_price": current_price,
-        "current_time": current_time,
-        "distance_from_vwap_pct": distance_from_vwap_pct,
-        "distance_from_ema20_pct": distance_from_ema20_pct,
-        "ema20": ema20,
-        "ema50": ema50,
-        "vwap": vwap,
-        "rsi14": rsi14,
-        "macd_hist": macd_hist,
-        "relative_volume": relative_volume,
-        "bb_position": bb_position,
-        "bb_width_pct": bb_width_pct,
-        "day_range_position": day_range_position,
-        "atr_like": atr_like,
-        "day_open": day_open,
-        "day_high": day_high,
-        "day_low": day_low,
-        "current_move_pct": current_move_pct,
-        "filters_summary": " | ".join(filters),
-    }
-
-    if bullish_structure:
-        entry_low = max(min(ema20, vwap), last_10_low)
-        entry_high = max(prev_high, current_price)
-        trigger_price = max(prev_high, current_price + buffer_value)
-
-        stop_price = min(last_20_low - buffer_value, min(ema20, vwap) - buffer_value)
-        risk = max(trigger_price - stop_price, min_risk)
-
-        target_1 = trigger_price + risk
-        target_2 = trigger_price + 2 * risk
-
-        out = base.copy()
-        out.update(common_values)
-        out.update({
-            "bias": "LONG_WATCH",
-            "title_he": "תרחיש לימודי עכשיו: לונג רק עם אישור",
-            "direction_he": "לונג",
-            "trend_state": "נטייה עולה לפי שילוב EMA/VWAP/RSI/MACD/ווליום",
-            "entry_zone": f"{entry_low:.2f} עד {entry_high:.2f}",
-            "trigger": f"כניסה לימודית רק אם יש סגירה/פריצה מעל {trigger_price:.2f}, או ריטסט שמחזיק מעל EMA20/VWAP.",
-            "stop": f"מתחת לתמיכה/EMA/VWAP: בערך {stop_price:.2f}",
-            "target_1": f"יעד 1R: בערך {target_1:.2f}",
-            "target_2": f"יעד 2R: בערך {target_2:.2f}",
-            "time_plan": "טווח בינוני 30-60 דקות: לבדוק כל 10-15 דקות, לא להשאיר בלי סטופ, ולסגור לפני סוף המסחר אם אין תוכנית אחרת.",
-            "reason": "רוב האינדיקטורים תומכים בכיוון עולה. עדיין נדרש טריגר מחיר — לא להיכנס רק בגלל שהמערכת מציגה לונג.",
-            "risk_reward": "בערך 1:1 ליעד ראשון ו־1:2 ליעד שני",
-        })
-
-        if too_extended_long:
-            out["entry_zone"] = f"לא לרדוף עכשיו. עדיף להמתין לריטסט לאזור {max(ema20, vwap):.2f} או לפריצה נקייה מעל {last_10_high:.2f}."
-            out["reason"] += " המחיר מתוח יחסית מעל EMA/VWAP ולכן הסיכון לתיקון גבוה יותר."
-
-        return out
-
-    if bearish_structure:
-        entry_high = min(max(ema20, vwap), last_10_high)
-        entry_low = min(prev_low, current_price)
-        trigger_price = min(prev_low, current_price - buffer_value)
-
-        stop_price = max(last_20_high + buffer_value, max(ema20, vwap) + buffer_value)
-        risk = max(stop_price - trigger_price, min_risk)
-
-        target_1 = trigger_price - risk
-        target_2 = trigger_price - 2 * risk
-
-        out = base.copy()
-        out.update(common_values)
-        out.update({
-            "bias": "SHORT_WATCH",
-            "title_he": "תרחיש לימודי עכשיו: שורט רק עם אישור",
-            "direction_he": "שורט",
-            "trend_state": "נטייה יורדת לפי שילוב EMA/VWAP/RSI/MACD/ווליום",
-            "entry_zone": f"{entry_low:.2f} עד {entry_high:.2f}",
-            "trigger": f"כניסה לימודית רק אם יש סגירה/שבירה מתחת {trigger_price:.2f}, או ריטסט שנכשל מתחת EMA20/VWAP.",
-            "stop": f"מעל התנגדות/EMA/VWAP: בערך {stop_price:.2f}",
-            "target_1": f"יעד 1R: בערך {target_1:.2f}",
-            "target_2": f"יעד 2R: בערך {target_2:.2f}",
-            "time_plan": "טווח בינוני 30-60 דקות: לבדוק כל 10-15 דקות, לא להשאיר בלי סטופ, ולסגור לפני סוף המסחר אם אין תוכנית אחרת.",
-            "reason": "רוב האינדיקטורים תומכים בכיוון יורד. עדיין נדרש טריגר מחיר — לא להיכנס רק בגלל שהמערכת מציגה שורט.",
-            "risk_reward": "בערך 1:1 ליעד ראשון ו־1:2 ליעד שני",
-        })
-
-        if too_extended_short:
-            out["entry_zone"] = f"לא לרדוף עכשיו. עדיף להמתין לריטסט לאזור {min(ema20, vwap):.2f} או לשבירה נקייה מתחת {last_10_low:.2f}."
-            out["reason"] += " המחיר מתוח יחסית מתחת EMA/VWAP ולכן הסיכון לריבאונד גבוה יותר."
-
-        return out
-
-    out = base.copy()
-    out.update(common_values)
-    out.update({
-        "trend_state": "מעורב / דשדוש",
-        "reason": (
-            "אין מספיק קונפלואנס בין EMA, VWAP, RSI, MACD, ווליום ומיקום בטווח היומי. "
-            "במצב כזה עדיף להמתין לפריצה, שבירה, או ריטסט ברור."
-        ),
-    })
-
-    return out
-
-
-
-def build_micro_scalp_plan(latest_day_df_1m: pd.DataFrame) -> dict:
-    """
-    Builds a very-short-term educational scalp scenario using 1-minute bars.
-
-    This is not investment advice. It is a rules-based paper-trading scenario
-    for the next 1-5 minutes only.
-    """
-
-    df = filter_regular_market_hours(latest_day_df_1m).copy()
-
-    base = {
-        "horizon": "טווח קצר מאוד — 1 עד 5 דקות",
-        "bias": "NO_TRADE",
-        "title_he": "סקאלפ קצר: אין טריגר נקי עכשיו",
-        "direction_he": "להמתין",
-        "confidence_he": "נמוכה",
-        "setup_score": 0,
-        "setup_quality": "חלש / מעורב",
-        "current_price": np.nan,
-        "current_time": "",
-        "entry_zone": "אין כניסה",
-        "trigger": "להמתין לשבירה/פריצה ברורה בנר דקה",
-        "stop": "לא רלוונטי",
-        "target_1": "לא רלוונטי",
-        "target_2": "לא רלוונטי",
-        "time_plan": "סקאלפ קצר: 1-5 דקות. אם אין תנועה מהירה לטובתך — יציאה.",
-        "reason": "אין מספיק אישור לטווח קצר מאוד.",
-        "filters_summary": "",
-        "risk_reward": "לא רלוונטי",
-        "ema5": np.nan,
-        "ema9": np.nan,
-        "ema21": np.nan,
-        "vwap": np.nan,
-        "rsi7": np.nan,
-        "micro_momentum_pct": np.nan,
-        "relative_volume": np.nan,
-        "atr_like": np.nan,
-    }
-
-    if df.empty or len(df) < 25:
-        out = base.copy()
-        out["reason"] = "אין מספיק נרות דקה כדי לבנות תרחיש סקאלפ."
-        return out
-
-    df = df.sort_index()
-
-    df["ema5"] = df["close"].ewm(span=5, adjust=False).mean()
-    df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
-    df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
-
-    typical_price = (df["high"] + df["low"] + df["close"]) / 3
-    df["vwap"] = (typical_price * df["volume"]).cumsum() / df["volume"].replace(0, np.nan).cumsum()
-
-    delta = df["close"].diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / 7, adjust=False, min_periods=7).mean()
-    avg_loss = loss.ewm(alpha=1 / 7, adjust=False, min_periods=7).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    df["rsi7"] = 100 - (100 / (1 + rs))
-
-    df["bar_range"] = df["high"] - df["low"]
-    df["atr_like"] = df["bar_range"].rolling(10, min_periods=5).mean()
-    df["volume_ma10"] = df["volume"].rolling(10, min_periods=5).mean()
-    df["relative_volume"] = df["volume"] / df["volume_ma10"].replace(0, np.nan)
-    df["micro_momentum_pct"] = (df["close"] / df["close"].shift(3) - 1) * 100
-
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    current_price = _safe_float(last["close"])
-    current_time = str(df.index[-1])
-    ema5 = _safe_float(last["ema5"])
-    ema9 = _safe_float(last["ema9"])
-    ema21 = _safe_float(last["ema21"])
-    vwap = _safe_float(last["vwap"])
-    rsi7 = _safe_float(last["rsi7"])
-    momentum = _safe_float(last["micro_momentum_pct"])
-    rel_vol = _safe_float(last["relative_volume"])
-    atr_like = _safe_float(last["atr_like"], current_price * 0.0015)
-
-    last_3_high = _safe_float(df["high"].tail(3).max())
-    last_3_low = _safe_float(df["low"].tail(3).min())
-    last_8_high = _safe_float(df["high"].tail(8).max())
-    last_8_low = _safe_float(df["low"].tail(8).min())
-    prev_high = _safe_float(prev["high"])
-    prev_low = _safe_float(prev["low"])
-
-    score = 0
-    filters = []
-
-    if current_price > vwap:
-        score += 1
-        filters.append("מעל VWAP")
-    elif current_price < vwap:
-        score -= 1
-        filters.append("מתחת VWAP")
-
-    if current_price > ema5 > ema9 > ema21:
-        score += 2
-        filters.append("EMA5/9/21 מיושרים למעלה")
-    elif current_price < ema5 < ema9 < ema21:
-        score -= 2
-        filters.append("EMA5/9/21 מיושרים למטה")
-    elif current_price > ema9:
-        score += 1
-        filters.append("מחיר מעל EMA9")
-    elif current_price < ema9:
-        score -= 1
-        filters.append("מחיר מתחת EMA9")
-
-    if pd.notna(momentum):
-        if momentum > 0.05:
-            score += 1
-            filters.append("מומנטום 3 נרות חיובי")
-        elif momentum < -0.05:
-            score -= 1
-            filters.append("מומנטום 3 נרות שלילי")
-
-    if pd.notna(rsi7):
-        if 48 <= rsi7 <= 72:
-            score += 1
-            filters.append("RSI7 תומך בלונג")
-        elif 28 <= rsi7 <= 52:
-            score -= 1
-            filters.append("RSI7 תומך בשורט")
-        elif rsi7 > 82:
-            score -= 1
-            filters.append("RSI7 גבוה מדי — לא לרדוף לונג")
-        elif rsi7 < 18:
-            score += 1
-            filters.append("RSI7 נמוך מדי — לא לרדוף שורט")
-
-    if pd.notna(rel_vol):
-        if rel_vol >= 1.15:
-            filters.append("ווליום קצר גבוה יחסית")
-        elif rel_vol < 0.70:
-            filters.append("ווליום קצר חלש")
-            if score > 0:
-                score -= 1
-            elif score < 0:
-                score += 1
-
-    buffer_value = max(current_price * 0.0003, atr_like * 0.10)
-    min_risk = max(current_price * 0.0008, atr_like * 0.50)
-
-    if abs(score) >= 5:
-        setup_quality = "חזק"
-        confidence_he = "גבוהה יחסית"
-    elif abs(score) >= 3:
-        setup_quality = "בינוני"
-        confidence_he = "בינונית"
-    else:
-        setup_quality = "חלש / מעורב"
-        confidence_he = "נמוכה"
-
-    common = {
-        "current_price": current_price,
-        "current_time": current_time,
-        "setup_score": int(score),
-        "setup_quality": setup_quality,
-        "confidence_he": confidence_he,
-        "ema5": ema5,
-        "ema9": ema9,
-        "ema21": ema21,
-        "vwap": vwap,
-        "rsi7": rsi7,
-        "micro_momentum_pct": momentum,
-        "relative_volume": rel_vol,
-        "atr_like": atr_like,
-        "filters_summary": " | ".join(filters),
-    }
-
-    if score >= 3 and current_price > ema9 and current_price > vwap:
-        trigger_price = max(prev_high, last_3_high) + buffer_value
-        stop_price = min(last_8_low, ema21) - buffer_value
-        risk = max(trigger_price - stop_price, min_risk)
-        target_1 = trigger_price + 0.8 * risk
-        target_2 = trigger_price + 1.5 * risk
-
-        out = base.copy()
-        out.update(common)
-        out.update({
-            "bias": "MICRO_LONG",
-            "title_he": "סקאלפ קצר: לונג רק עם טריגר דקה",
-            "direction_he": "לונג קצר",
-            "entry_zone": f"{current_price:.2f} עד {trigger_price:.2f}",
-            "trigger": f"כניסה לימודית רק מעל {trigger_price:.2f} בנר דקה, עם נר שסוגר חזק.",
-            "stop": f"סטופ קצר מתחת {stop_price:.2f}",
-            "target_1": f"יעד מהיר 1: בערך {target_1:.2f}",
-            "target_2": f"יעד מהיר 2: בערך {target_2:.2f}",
-            "time_plan": "טווח קצר מאוד: 1-5 דקות. אם אחרי 1-2 נרות אין המשך — לצאת בדמו.",
-            "reason": "הסקור הקצר חיובי: מחיר/EMA/VWAP/מומנטום תומכים בתרחיש לונג קצר.",
-            "risk_reward": "בערך 0.8R עד 1.5R בסקאלפ",
-        })
-        return out
-
-    if score <= -3 and current_price < ema9 and current_price < vwap:
-        trigger_price = min(prev_low, last_3_low) - buffer_value
-        stop_price = max(last_8_high, ema21) + buffer_value
-        risk = max(stop_price - trigger_price, min_risk)
-        target_1 = trigger_price - 0.8 * risk
-        target_2 = trigger_price - 1.5 * risk
-
-        out = base.copy()
-        out.update(common)
-        out.update({
-            "bias": "MICRO_SHORT",
-            "title_he": "סקאלפ קצר: שורט רק עם טריגר דקה",
-            "direction_he": "שורט קצר",
-            "entry_zone": f"{trigger_price:.2f} עד {current_price:.2f}",
-            "trigger": f"כניסה לימודית רק מתחת {trigger_price:.2f} בנר דקה, עם נר שסוגר חלש.",
-            "stop": f"סטופ קצר מעל {stop_price:.2f}",
-            "target_1": f"יעד מהיר 1: בערך {target_1:.2f}",
-            "target_2": f"יעד מהיר 2: בערך {target_2:.2f}",
-            "time_plan": "טווח קצר מאוד: 1-5 דקות. אם אחרי 1-2 נרות אין המשך — לצאת בדמו.",
-            "reason": "הסקור הקצר שלילי: מחיר/EMA/VWAP/מומנטום תומכים בתרחיש שורט קצר.",
-            "risk_reward": "בערך 0.8R עד 1.5R בסקאלפ",
-        })
-        return out
-
-    out = base.copy()
-    out.update(common)
-    out.update({
-        "reason": "בטווח הדקה אין מספיק אישור. ייתכן שבטווח 30-60 דקות יש תמונה אחרת, אבל לסקאלפ קצר עדיף להמתין.",
-    })
-    return out
-
-
-
-def plot_candles_with_indicators(df: pd.DataFrame, title: str = "Current chart"):
-    """
-    Candlestick chart with EMA20, EMA50, VWAP and volume.
-    """
-
-    if df.empty:
-        return None
-
-    plot_df = add_realtime_indicators(df).tail(160)
-
-    if plot_df.empty:
-        return None
-
-    fig = make_subplots(
-        rows=2,
-        cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.04,
-        row_heights=[0.75, 0.25],
-    )
-
-    fig.add_trace(
-        go.Candlestick(
-            x=plot_df.index,
-            open=plot_df["open"],
-            high=plot_df["high"],
-            low=plot_df["low"],
-            close=plot_df["close"],
-            name="Price",
-        ),
-        row=1,
-        col=1,
-    )
-
-    fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df["ema20"], mode="lines", name="EMA20"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df["ema50"], mode="lines", name="EMA50"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df["vwap"], mode="lines", name="VWAP"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df["bb_upper"], mode="lines", name="BB Upper", opacity=0.35), row=1, col=1)
-    fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df["bb_lower"], mode="lines", name="BB Lower", opacity=0.35), row=1, col=1)
-
-    fig.add_trace(
-        go.Bar(
-            x=plot_df.index,
-            y=plot_df["volume"],
-            name="Volume",
-            opacity=0.55,
-        ),
-        row=2,
-        col=1,
-    )
-
-    fig.update_layout(
-        title=title,
-        height=700,
-        xaxis_rangeslider_visible=False,
-        margin=dict(l=10, r=10, t=50, b=20),
-        template="plotly_white",
-    )
-
-    fig.update_yaxes(title_text="Price", row=1, col=1)
-    fig.update_yaxes(title_text="Volume", row=2, col=1)
-
-    return fig
-
-
-# ============================================================
-# Plotting
-# ============================================================
-
-def plot_candles(df: pd.DataFrame, title: str = "Candlestick Chart"):
-    if df.empty:
-        return None
-
-    plot_df = df.copy().tail(160)
-
-    fig = make_subplots(
-        rows=2,
-        cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.04,
-        row_heights=[0.75, 0.25],
-    )
-
-    fig.add_trace(
-        go.Candlestick(
-            x=plot_df.index,
-            open=plot_df["open"],
-            high=plot_df["high"],
-            low=plot_df["low"],
-            close=plot_df["close"],
-            name="Price",
-        ),
-        row=1,
-        col=1,
-    )
-
-    fig.add_trace(
-        go.Bar(
-            x=plot_df.index,
-            y=plot_df["volume"],
-            name="Volume",
-            opacity=0.55,
-        ),
-        row=2,
-        col=1,
-    )
-
-    fig.update_layout(
-        title=title,
-        height=650,
-        xaxis_rangeslider_visible=False,
-        margin=dict(l=10, r=10, t=50, b=20),
-        template="plotly_white",
-    )
-
-    fig.update_yaxes(title_text="Price", row=1, col=1)
-    fig.update_yaxes(title_text="Volume", row=2, col=1)
-
-    return fig
-
-
-def plot_probability_bar(summary: pd.DataFrame, opening_type: str):
-    if summary.empty:
-        return None
-
-    filtered = summary[summary["opening_type"] == opening_type].copy()
-
-    if filtered.empty:
-        return None
-
-    fig = go.Figure()
-    fig.add_trace(
-        go.Bar(
-            x=filtered["after_result"],
-            y=filtered["probability_pct"],
-            text=filtered["probability_pct"].round(1).astype(str) + "%",
-            textposition="auto",
-        )
-    )
-
-    fig.update_layout(
-        title=f"הסתברויות היסטוריות עבור {opening_type}",
-        xaxis_title="מה קרה אחרי הפתיחה",
-        yaxis_title="הסתברות באחוזים",
-        height=420,
-        template="plotly_white",
-        margin=dict(l=10, r=10, t=50, b=20),
-    )
-    return fig
-
-
-# ============================================================
-# Files
-# ============================================================
-
-def save_outputs(ticker: str, results: pd.DataFrame, summary_by_type: pd.DataFrame,
-                 summary_by_volume: pd.DataFrame, eod_summary: pd.DataFrame):
-    results_path = DATA_DIR / f"{ticker}_detailed_opening_results.csv"
-    summary_path = DATA_DIR / f"{ticker}_summary_by_opening_type.csv"
-    volume_path = DATA_DIR / f"{ticker}_summary_by_opening_type_volume.csv"
-    eod_path = DATA_DIR / f"{ticker}_eod_summary_by_opening_type.csv"
-
-    results.to_csv(results_path, index=False)
-    summary_by_type.to_csv(summary_path, index=False)
-    summary_by_volume.to_csv(volume_path, index=False)
-    eod_summary.to_csv(eod_path, index=False)
-
-    return {
-        "results": results_path,
-        "summary_by_type": summary_path,
-        "summary_by_volume": volume_path,
-        "eod_summary": eod_path,
-    }
-
-
-def load_summary_file(ticker: str) -> pd.DataFrame:
-    path = DATA_DIR / f"{ticker}_summary_by_opening_type.csv"
-    if not path.exists():
-        return pd.DataFrame()
-    return pd.read_csv(path)
-
-
-def run_history_for_ticker(ticker: str, cfg: AnalyzerConfig):
-    df = fetch_intraday_yfinance(
-        ticker=ticker,
-        days_back=cfg.days_back,
-        interval_minutes=cfg.bar_minutes,
-    )
-
-    if df.empty:
-        return df, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-
-    results = analyze_history(df, cfg)
-    summary_by_type = probability_summary_by_opening_type(results, min_samples=cfg.min_samples)
-    summary_by_volume = probability_summary_by_type_and_volume(results, min_samples=cfg.min_samples)
-    eod_summary = eod_summary_by_opening_type(results, min_samples=cfg.min_samples)
-
-    save_outputs(
-        ticker=ticker,
-        results=results,
-        summary_by_type=summary_by_type,
-        summary_by_volume=summary_by_volume,
-        eod_summary=eod_summary,
-    )
-
-    return df, results, summary_by_type, summary_by_volume, eod_summary
-
-
-# ============================================================
-# Sidebar
-# ============================================================
-
-st.sidebar.title("⚙️ הגדרות")
-
-days_back = st.sidebar.slider(
-    "כמה ימים אחורה לבדוק",
-    min_value=5,
-    max_value=59,
-    value=59,
-    step=1,
-    help="ב־yfinance נתוני intraday מוגבלים לתקופה קצרה. לכן זה עד 59 יום.",
-)
-
-bar_minutes = st.sidebar.selectbox(
-    "גודל נר",
-    options=[1, 5, 15, 30, 60],
-    index=1,
-    help="נר 1 דקה עובד רק על תקופה קצרה יותר ב-yfinance, לכן האפליקציה תגביל אותו אוטומטית.",
-)
-
-first_window_minutes = st.sidebar.selectbox(
-    "חלון פתיחה לבדיקה",
-    options=[5, 10, 15, 30, 45, 60],
-    index=3,
-)
-
-moderate_threshold_pct = st.sidebar.number_input(
-    "סף לתנועה מתונה באחוזים",
-    min_value=0.05,
-    max_value=5.0,
-    value=0.30,
-    step=0.05,
-)
-
-sharp_threshold_pct = st.sidebar.number_input(
-    "סף לתנועה חדה באחוזים",
-    min_value=0.10,
-    max_value=10.0,
-    value=0.80,
-    step=0.05,
-)
-
-continuation_fraction = st.sidebar.number_input(
-    "המשך תנועה: כמה מהמהלך הראשון",
-    min_value=0.10,
-    max_value=2.00,
-    value=0.50,
-    step=0.05,
-)
-
-retrace_fraction = st.sidebar.number_input(
-    "תיקון: כמה מהמהלך הראשון",
-    min_value=0.10,
-    max_value=1.00,
-    value=0.50,
-    step=0.05,
-)
-
-min_samples = st.sidebar.slider(
-    "מינימום מקרים להצגה",
-    min_value=2,
-    max_value=30,
-    value=5,
-    step=1,
-)
-
-cfg = AnalyzerConfig(
-    days_back=int(days_back),
-    bar_minutes=int(bar_minutes),
-    first_window_minutes=int(first_window_minutes),
-    moderate_threshold_pct=float(moderate_threshold_pct),
-    sharp_threshold_pct=float(sharp_threshold_pct),
-    continuation_fraction=float(continuation_fraction),
-    retrace_fraction=float(retrace_fraction),
-    min_samples=int(min_samples),
-)
-
-if int(bar_minutes) == 1 and int(days_back) > 7:
-    st.sidebar.warning("בחרת נר 1 דקה. בגלל מגבלת yfinance, האפליקציה תשתמש בפועל רק עד 7 ימים אחורה.")
-
-
-# ============================================================
-# Header
-# ============================================================
-
-st.markdown('<div class="main-title">📊 Market Open Analyzer - Free</div>', unsafe_allow_html=True)
-st.markdown(
-    '<div class="subtitle">גרסה חינמית ללא API Key — yfinance + EMA/VWAP/RSI/MACD/Bollinger/Volume</div>',
-    unsafe_allow_html=True,
-)
-
-st.markdown(
-    """
-<div class="warning-card">
-<strong>חשוב:</strong>
-זו גרסה חינמית ללימוד ובדיקה. היא לא נותנת 5 שנים אחורה.
-בדרך כלל היא מוגבלת לנתוני intraday מהתקופה האחרונה בלבד.
-זה לא כלי המלצה לקנייה/מכירה ולא מבצע עסקאות.
-</div>
-""",
-    unsafe_allow_html=True,
-)
-
-
-
-# ============================================================
-# Paper Trading - automatic simulation only
-# ============================================================
-
-PAPER_TRADES_FILE = DATA_DIR / "paper_trades.csv"
-
-PAPER_COLUMNS = [
-    "trade_id",
-    "opened_at",
-    "closed_at",
-    "status",
-    "ticker",
-    "horizon",
-    "side",
-    "entry_price",
-    "stop_price",
-    "target_1",
-    "target_2",
-    "current_price",
-    "quantity",
-    "notional",
-    "risk_dollars",
-
-    # Cost model
-    "cost_pct_per_side",
-    "fixed_fee_per_side",
-    "min_fee_per_side",
-    "max_cost_to_target_pct",
-
-    # Costs
-    "estimated_entry_cost",
-    "estimated_exit_cost",
-    "total_trade_cost",
-    "commission_per_trade",
-
-    # Gross and net PnL
-    "gross_pnl",
-    "gross_pnl_pct",
-    "net_pnl",
-    "net_pnl_pct",
-
-    # Backward-compatible names used by older UI parts.
-    "pnl",
-    "pnl_pct",
-
-    # Tradeoff / expectancy at entry
-    "expected_gross_to_target",
-    "expected_total_cost_to_target",
-    "expected_net_to_target",
-    "cost_to_target_ratio_pct",
-    "tradeoff_status",
-
-    "exit_reason",
-    "signal_score",
-    "signal_quality",
-    "reason",
+TRADES_FILE = DATA_DIR / "trades_v2.csv"
+TICKERS_FILE = DATA_DIR / "tickers_v2.json"
+COSTS_FILE = DATA_DIR / "costs_v2.json"
+UNITS_FILE = DATA_DIR / "units_v2.json"
+RULES_FILE = DATA_DIR / "rules_v2.json"
+
+NY_TZ = "America/New_York"
+
+DEFAULT_TICKERS = ["QQQ", "SPY", "AAPL", "NVDA", "TSLA", "MSFT", "AMD", "META", "AMZN", "GOOGL", "NFLX", "SMCI", "PLTR", "MSTR"]
+
+DEFAULT_COSTS = {
+    "cost_pct_per_side": 0.02,
+    "fixed_fee_per_side": 0.0,
+    "min_fee_per_side": 0.0,
+    "max_cost_to_target_pct": 25.0,
+}
+
+DEFAULT_UNITS = {
+    "base_unit_dollars": 200.0,
+    "max_trade_dollars": 2000.0,
+    "score_units": {
+        "1": 0.0, "2": 0.0, "3": 1.0, "4": 1.25,
+        "5": 1.75, "6": 2.5, "7": 3.5, "8": 5.0,
+    },
+}
+
+DEFAULT_RULES = {
+    "min_hold_fast_minutes": 3,
+    "min_hold_half_hour_minutes": 10,
+    "cooldown_after_close_minutes": 8,
+    "max_new_trades_per_scan": 3,
+    "min_profit_r_for_profit_stop": 0.55,
+    "emergency_exit_after_minutes": 2,
+}
+
+TRADE_COLUMNS = [
+    "trade_id", "status", "ticker", "mode", "side", "score",
+    "entry_time", "exit_time", "age_minutes",
+    "entry_price", "current_price", "exit_price",
+    "quantity", "notional",
+    "stop_loss", "initial_stop_loss", "profit_stop", "target_reference",
+    "highest_price", "lowest_price",
+    "entry_cost", "exit_cost", "total_cost",
+    "gross_pnl", "net_pnl", "net_pnl_pct",
+    "exit_reason", "management_action", "management_reason", "signal_reason",
+    "cost_pct_per_side", "fixed_fee_per_side", "min_fee_per_side", "max_cost_to_target_pct",
+    "base_unit_dollars", "unit_multiplier",
+    "created_settings_snapshot",
 ]
 
 
-def _extract_last_number(text_value) -> float:
-    """
-    Extract the last number from a Hebrew/English text field.
-    Example: 'בערך 123.45' -> 123.45
-    """
-    import re
-
-    if text_value is None:
-        return np.nan
-
-    matches = re.findall(r"[-+]?\d+(?:\.\d+)?", str(text_value))
-    if not matches:
-        return np.nan
-
-    try:
-        return float(matches[-1])
-    except Exception:
-        return np.nan
-
-
-def _to_float(value, default: float = 0.0) -> float:
-    try:
-        if pd.isna(value):
-            return float(default)
-        return float(value)
-    except Exception:
-        return float(default)
-
-
-def calculate_side_cost(
-    side_notional: float,
-    cost_pct_per_side: float = 0.02,
-    fixed_fee_per_side: float = 0.0,
-    min_fee_per_side: float = 0.0,
-) -> float:
-    """
-    Calculate estimated cost for one side of a trade.
-
-    cost_pct_per_side is in percent.
-    Example: 0.02 means 0.02% per side, about 0.04% round trip.
-    """
-    side_notional = max(float(side_notional), 0.0)
-    variable_cost = side_notional * (float(cost_pct_per_side) / 100.0)
-    raw_cost = variable_cost + float(fixed_fee_per_side)
-    return float(max(raw_cost, float(min_fee_per_side)))
-
-
-def estimate_trade_costs(
-    entry_price: float,
-    exit_price: float,
-    quantity: float,
-    cost_pct_per_side: float = 0.02,
-    fixed_fee_per_side: float = 0.0,
-    min_fee_per_side: float = 0.0,
-) -> tuple[float, float, float]:
-    """
-    Return entry_cost, exit_cost, total_cost.
-    """
-    entry_notional = abs(float(entry_price) * float(quantity))
-    exit_notional = abs(float(exit_price) * float(quantity))
-
-    entry_cost = calculate_side_cost(
-        entry_notional,
-        cost_pct_per_side=cost_pct_per_side,
-        fixed_fee_per_side=fixed_fee_per_side,
-        min_fee_per_side=min_fee_per_side,
-    )
-
-    exit_cost = calculate_side_cost(
-        exit_notional,
-        cost_pct_per_side=cost_pct_per_side,
-        fixed_fee_per_side=fixed_fee_per_side,
-        min_fee_per_side=min_fee_per_side,
-    )
-
-    return float(entry_cost), float(exit_cost), float(entry_cost + exit_cost)
-
-
-def evaluate_trade_after_cost(
-    side: str,
-    entry_price: float,
-    target_price: float,
-    quantity: float,
-    cost_pct_per_side: float,
-    fixed_fee_per_side: float,
-    min_fee_per_side: float,
-    max_cost_to_target_pct: float,
-) -> dict:
-    """
-    Evaluate whether the expected move to target is still worthwhile after costs.
-    """
-    entry_price = float(entry_price)
-    target_price = float(target_price)
-    quantity = float(quantity)
-
-    if str(side) == "LONG":
-        expected_gross = (target_price - entry_price) * quantity
-    else:
-        expected_gross = (entry_price - target_price) * quantity
-
-    entry_cost, exit_cost, total_cost = estimate_trade_costs(
-        entry_price=entry_price,
-        exit_price=target_price,
-        quantity=quantity,
-        cost_pct_per_side=cost_pct_per_side,
-        fixed_fee_per_side=fixed_fee_per_side,
-        min_fee_per_side=min_fee_per_side,
-    )
-
-    expected_net = expected_gross - total_cost
-
-    if expected_gross > 0:
-        cost_ratio = (total_cost / expected_gross) * 100.0
-    else:
-        cost_ratio = 999.0
-
-    if expected_net <= 0:
-        status = "לא כדאי אחרי עלויות"
-        is_worth_it = False
-    elif cost_ratio > float(max_cost_to_target_pct):
-        status = "גבולי/לא כדאי - העלות גדולה מדי ביחס ליעד"
-        is_worth_it = False
-    else:
-        status = "כדאי לבדיקה בדמו אחרי עלויות"
-        is_worth_it = True
-
-    return {
-        "expected_gross_to_target": float(expected_gross),
-        "expected_total_cost_to_target": float(total_cost),
-        "expected_net_to_target": float(expected_net),
-        "cost_to_target_ratio_pct": float(cost_ratio),
-        "tradeoff_status": status,
-        "is_worth_it": bool(is_worth_it),
-        "entry_cost_to_target": float(entry_cost),
-        "exit_cost_to_target": float(exit_cost),
-    }
-
-
-def load_paper_trades() -> pd.DataFrame:
-    """
-    Load paper trades from local CSV.
-    """
-    if not PAPER_TRADES_FILE.exists():
-        return pd.DataFrame(columns=PAPER_COLUMNS)
-
-    df = pd.read_csv(PAPER_TRADES_FILE)
-
-    for col in PAPER_COLUMNS:
-        if col not in df.columns:
-            df[col] = np.nan
-
-    return df[PAPER_COLUMNS]
-
-
-def save_paper_trades(df: pd.DataFrame) -> None:
-    """
-    Save paper trades to local CSV.
-    """
-    if df is None or df.empty:
-        pd.DataFrame(columns=PAPER_COLUMNS).to_csv(PAPER_TRADES_FILE, index=False)
-        return
-
-    for col in PAPER_COLUMNS:
-        if col not in df.columns:
-            df[col] = np.nan
-
-    df[PAPER_COLUMNS].to_csv(PAPER_TRADES_FILE, index=False)
-
-
-def clear_paper_trades() -> None:
-    """
-    Clear all paper trading history.
-    """
-    pd.DataFrame(columns=PAPER_COLUMNS).to_csv(PAPER_TRADES_FILE, index=False)
-
-
-def get_open_trade_mask(trades: pd.DataFrame, ticker: str, horizon: str) -> pd.Series:
-    if trades.empty:
-        return pd.Series(dtype=bool)
-    return (
-        trades["status"].eq("OPEN")
-        & trades["ticker"].astype(str).eq(str(ticker))
-        & trades["horizon"].astype(str).eq(str(horizon))
-    )
-
-
-def create_paper_trade_from_plan(
-    ticker: str,
-    horizon: str,
-    plan: dict,
-    risk_dollars: float = 25.0,
-    max_notional: float = 1000.0,
-    cost_pct_per_side: float = 0.02,
-    fixed_fee_per_side: float = 0.0,
-    min_fee_per_side: float = 0.0,
-    max_cost_to_target_pct: float = 25.0,
-) -> tuple[dict | None, str]:
-    """
-    Create a paper trade from an educational plan.
-    This does not execute any real order.
-
-    Returns: trade dict or None, message.
-    """
-
-    bias = str(plan.get("bias", ""))
-
-    if bias in ["LONG_WATCH", "MICRO_LONG"]:
-        side = "LONG"
-    elif bias in ["SHORT_WATCH", "MICRO_SHORT"]:
-        side = "SHORT"
-    else:
-        return None, "אין איתות לונג/שורט."
-
-    entry_price = _safe_float(plan.get("current_price", np.nan))
-    stop_price = _extract_last_number(plan.get("stop", ""))
-    target_1 = _extract_last_number(plan.get("target_1", ""))
-    target_2 = _extract_last_number(plan.get("target_2", ""))
-
-    if not np.isfinite(entry_price) or entry_price <= 0:
-        return None, "מחיר כניסה לא תקין."
-    if not np.isfinite(stop_price) or stop_price <= 0:
-        return None, "סטופ לא תקין."
-    if not np.isfinite(target_1) or target_1 <= 0:
-        return None, "יעד ראשון לא תקין."
-
-    if side == "LONG":
-        if stop_price >= entry_price or target_1 <= entry_price:
-            return None, "מבנה לונג לא תקין: יעד/סטופ לא בכיוון נכון."
-    else:
-        if stop_price <= entry_price or target_1 >= entry_price:
-            return None, "מבנה שורט לא תקין: יעד/סטופ לא בכיוון נכון."
-
-    risk_per_share = abs(entry_price - stop_price)
-    if risk_per_share <= 0:
-        return None, "סיכון למניה לא תקין."
-
-    quantity = float(risk_dollars) / risk_per_share
-
-    if max_notional and max_notional > 0:
-        quantity = min(quantity, float(max_notional) / entry_price)
-
-    quantity = max(float(quantity), 0.0)
-
-    if quantity <= 0:
-        return None, "כמות דמיונית לא תקינה."
-
-    # Tradeoff: only open if the target is still worthwhile after entry+exit costs.
-    tradeoff = evaluate_trade_after_cost(
-        side=side,
-        entry_price=entry_price,
-        target_price=target_1,
-        quantity=quantity,
-        cost_pct_per_side=cost_pct_per_side,
-        fixed_fee_per_side=fixed_fee_per_side,
-        min_fee_per_side=min_fee_per_side,
-        max_cost_to_target_pct=max_cost_to_target_pct,
-    )
-
-    if not tradeoff["is_worth_it"]:
-        return None, (
-            f"דילוג אחרי עלויות: {tradeoff['tradeoff_status']} | "
-            f"ברוטו ליעד ${tradeoff['expected_gross_to_target']:.2f}, "
-            f"עלות ${tradeoff['expected_total_cost_to_target']:.2f}, "
-            f"נטו ${tradeoff['expected_net_to_target']:.2f}"
-        )
-
-    entry_cost, exit_cost_now, total_cost_now = estimate_trade_costs(
-        entry_price=entry_price,
-        exit_price=entry_price,
-        quantity=quantity,
-        cost_pct_per_side=cost_pct_per_side,
-        fixed_fee_per_side=fixed_fee_per_side,
-        min_fee_per_side=min_fee_per_side,
-    )
-
-    now_ts = pd.Timestamp.now(tz="America/New_York").isoformat()
-
-    trade = {
-        "trade_id": f"{ticker}_{horizon}_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S_%f')}",
-        "opened_at": now_ts,
-        "closed_at": "",
-        "status": "OPEN",
-        "ticker": ticker,
-        "horizon": horizon,
-        "side": side,
-        "entry_price": float(entry_price),
-        "stop_price": float(stop_price),
-        "target_1": float(target_1),
-        "target_2": float(target_2) if np.isfinite(target_2) else np.nan,
-        "current_price": float(entry_price),
-        "quantity": float(quantity),
-        "notional": float(quantity * entry_price),
-        "risk_dollars": float(risk_dollars),
-
-        "cost_pct_per_side": float(cost_pct_per_side),
-        "fixed_fee_per_side": float(fixed_fee_per_side),
-        "min_fee_per_side": float(min_fee_per_side),
-        "max_cost_to_target_pct": float(max_cost_to_target_pct),
-
-        "estimated_entry_cost": float(entry_cost),
-        "estimated_exit_cost": float(exit_cost_now),
-        "total_trade_cost": float(total_cost_now),
-        "commission_per_trade": float(total_cost_now),
-
-        "gross_pnl": 0.0,
-        "gross_pnl_pct": 0.0,
-        "net_pnl": -float(total_cost_now),
-        "net_pnl_pct": (-float(total_cost_now) / float(quantity * entry_price)) * 100 if quantity * entry_price > 0 else 0.0,
-
-        "pnl": -float(total_cost_now),
-        "pnl_pct": (-float(total_cost_now) / float(quantity * entry_price)) * 100 if quantity * entry_price > 0 else 0.0,
-
-        "expected_gross_to_target": float(tradeoff["expected_gross_to_target"]),
-        "expected_total_cost_to_target": float(tradeoff["expected_total_cost_to_target"]),
-        "expected_net_to_target": float(tradeoff["expected_net_to_target"]),
-        "cost_to_target_ratio_pct": float(tradeoff["cost_to_target_ratio_pct"]),
-        "tradeoff_status": str(tradeoff["tradeoff_status"]),
-
-        "exit_reason": "",
-        "signal_score": int(plan.get("setup_score", 0) or 0),
-        "signal_quality": str(plan.get("setup_quality", "")),
-        "reason": str(plan.get("reason", ""))[:350],
-    }
-
-    return trade, "עסקת נייר נפתחה אחרי בדיקת עלויות."
-
-
-def _calculate_trade_pnl_with_costs(row, current_price: float) -> dict:
-    """
-    Calculate gross/net PnL and current estimated total costs.
-    """
-    entry = _to_float(row.get("entry_price", np.nan), 0.0)
-    qty = _to_float(row.get("quantity", np.nan), 0.0)
-
-    if entry <= 0 or qty <= 0:
-        return {
-            "gross_pnl": 0.0,
-            "gross_pnl_pct": 0.0,
-            "net_pnl": 0.0,
-            "net_pnl_pct": 0.0,
-            "estimated_entry_cost": 0.0,
-            "estimated_exit_cost": 0.0,
-            "total_trade_cost": 0.0,
-            "commission_per_trade": 0.0,
-        }
-
-    current_price = float(current_price)
-
-    if str(row.get("side", "")) == "LONG":
-        gross_pnl = (current_price - entry) * qty
-    else:
-        gross_pnl = (entry - current_price) * qty
-
-    notional = entry * qty
-    gross_pnl_pct = (gross_pnl / notional) * 100 if notional > 0 else 0.0
-
-    cost_pct_per_side = _to_float(row.get("cost_pct_per_side", 0.02), 0.02)
-    fixed_fee_per_side = _to_float(row.get("fixed_fee_per_side", 0.0), 0.0)
-    min_fee_per_side = _to_float(row.get("min_fee_per_side", 0.0), 0.0)
-
-    entry_cost = _to_float(row.get("estimated_entry_cost", np.nan), np.nan)
-    if not np.isfinite(entry_cost):
-        entry_cost = calculate_side_cost(
-            notional,
-            cost_pct_per_side=cost_pct_per_side,
-            fixed_fee_per_side=fixed_fee_per_side,
-            min_fee_per_side=min_fee_per_side,
-        )
-
-    exit_cost = calculate_side_cost(
-        abs(current_price * qty),
-        cost_pct_per_side=cost_pct_per_side,
-        fixed_fee_per_side=fixed_fee_per_side,
-        min_fee_per_side=min_fee_per_side,
-    )
-
-    total_cost = entry_cost + exit_cost
-    net_pnl = gross_pnl - total_cost
-    net_pnl_pct = (net_pnl / notional) * 100 if notional > 0 else 0.0
-
-    return {
-        "gross_pnl": float(gross_pnl),
-        "gross_pnl_pct": float(gross_pnl_pct),
-        "net_pnl": float(net_pnl),
-        "net_pnl_pct": float(net_pnl_pct),
-        "estimated_entry_cost": float(entry_cost),
-        "estimated_exit_cost": float(exit_cost),
-        "total_trade_cost": float(total_cost),
-        "commission_per_trade": float(total_cost),
-    }
-
-
-def _calculate_trade_pnl(row, current_price: float) -> tuple[float, float]:
-    """
-    Backward compatible: returns net pnl and net pnl percent.
-    """
-    calc = _calculate_trade_pnl_with_costs(row, current_price)
-    return float(calc["net_pnl"]), float(calc["net_pnl_pct"])
-
-
-def update_open_paper_trades(trades: pd.DataFrame) -> pd.DataFrame:
-    """
-    Update open paper trades using latest 1-minute yfinance data.
-    Closes a trade when stop or target_1 is reached.
-    Costs are included, so pnl is net after estimated entry+exit costs.
-    """
-
-    if trades.empty:
-        return trades
-
-    trades = trades.copy()
-
-    for col in PAPER_COLUMNS:
-        if col not in trades.columns:
-            trades[col] = np.nan
-
-    open_indices = trades.index[trades["status"].eq("OPEN")].tolist()
-
-    for idx in open_indices:
-        ticker = str(trades.loc[idx, "ticker"])
-
-        try:
-            df = fetch_intraday_yfinance(
-                ticker=ticker,
-                days_back=7,
-                interval_minutes=1,
-            )
-            latest_day_df = get_latest_trading_day(df)
-
-            if latest_day_df.empty:
-                continue
-
-            latest_day_df = latest_day_df.sort_index()
-            current_price = float(latest_day_df.iloc[-1]["close"])
-
-            opened_at_raw = trades.loc[idx, "opened_at"]
-            try:
-                opened_at = pd.Timestamp(opened_at_raw)
-                if opened_at.tzinfo is None:
-                    opened_at = opened_at.tz_localize("America/New_York")
-                else:
-                    opened_at = opened_at.tz_convert("America/New_York")
-                after_entry = latest_day_df[latest_day_df.index >= opened_at]
-                if after_entry.empty:
-                    after_entry = latest_day_df.tail(1)
-            except Exception:
-                after_entry = latest_day_df.tail(1)
-
-            side = str(trades.loc[idx, "side"])
-            stop_price = float(trades.loc[idx, "stop_price"])
-            target_1 = float(trades.loc[idx, "target_1"])
-
-            exit_price = None
-            exit_reason = None
-            exit_time = None
-
-            if side == "LONG":
-                stop_hits = after_entry[after_entry["low"] <= stop_price]
-                target_hits = after_entry[after_entry["high"] >= target_1]
-
-                stop_time = stop_hits.index.min() if not stop_hits.empty else None
-                target_time = target_hits.index.min() if not target_hits.empty else None
-
-                if stop_time is not None and target_time is not None:
-                    if stop_time <= target_time:
-                        exit_price = stop_price
-                        exit_reason = "STOP"
-                        exit_time = stop_time
-                    else:
-                        exit_price = target_1
-                        exit_reason = "TARGET_1"
-                        exit_time = target_time
-                elif stop_time is not None:
-                    exit_price = stop_price
-                    exit_reason = "STOP"
-                    exit_time = stop_time
-                elif target_time is not None:
-                    exit_price = target_1
-                    exit_reason = "TARGET_1"
-                    exit_time = target_time
-
-            else:
-                stop_hits = after_entry[after_entry["high"] >= stop_price]
-                target_hits = after_entry[after_entry["low"] <= target_1]
-
-                stop_time = stop_hits.index.min() if not stop_hits.empty else None
-                target_time = target_hits.index.min() if not target_hits.empty else None
-
-                if stop_time is not None and target_time is not None:
-                    if stop_time <= target_time:
-                        exit_price = stop_price
-                        exit_reason = "STOP"
-                        exit_time = stop_time
-                    else:
-                        exit_price = target_1
-                        exit_reason = "TARGET_1"
-                        exit_time = target_time
-                elif stop_time is not None:
-                    exit_price = stop_price
-                    exit_reason = "STOP"
-                    exit_time = stop_time
-                elif target_time is not None:
-                    exit_price = target_1
-                    exit_reason = "TARGET_1"
-                    exit_time = target_time
-
-            price_for_calc = float(exit_price) if exit_price is not None else float(current_price)
-            calc = _calculate_trade_pnl_with_costs(trades.loc[idx], price_for_calc)
-
-            trades.loc[idx, "current_price"] = price_for_calc
-            trades.loc[idx, "estimated_entry_cost"] = calc["estimated_entry_cost"]
-            trades.loc[idx, "estimated_exit_cost"] = calc["estimated_exit_cost"]
-            trades.loc[idx, "total_trade_cost"] = calc["total_trade_cost"]
-            trades.loc[idx, "commission_per_trade"] = calc["commission_per_trade"]
-            trades.loc[idx, "gross_pnl"] = calc["gross_pnl"]
-            trades.loc[idx, "gross_pnl_pct"] = calc["gross_pnl_pct"]
-            trades.loc[idx, "net_pnl"] = calc["net_pnl"]
-            trades.loc[idx, "net_pnl_pct"] = calc["net_pnl_pct"]
-
-            # Backward compatible display fields.
-            trades.loc[idx, "pnl"] = calc["net_pnl"]
-            trades.loc[idx, "pnl_pct"] = calc["net_pnl_pct"]
-
-            if exit_price is not None:
-                trades.loc[idx, "status"] = "CLOSED"
-                trades.loc[idx, "exit_reason"] = exit_reason
-                trades.loc[idx, "closed_at"] = str(exit_time) if exit_time is not None else pd.Timestamp.now(tz="America/New_York").isoformat()
-
-        except Exception:
-            continue
-
-    save_paper_trades(trades)
-    return trades
-
-
-def paper_scan_and_open_trades(
-    ticker_options: dict[str, str],
-    cfg: AnalyzerConfig,
-    mode: str,
-    risk_dollars: float,
-    max_notional: float,
-    min_abs_score: int,
-    max_open_trades: int,
-    cost_pct_per_side: float = 0.02,
-    fixed_fee_per_side: float = 0.0,
-    min_fee_per_side: float = 0.0,
-    max_cost_to_target_pct: float = 25.0,
-) -> tuple[pd.DataFrame, list[str]]:
-    """
-    Update existing trades, scan tickers, and open new paper trades when signals exist.
-    Includes cost tradeoff before opening a paper trade.
-    """
-
-    trades = load_paper_trades()
-    trades = update_open_paper_trades(trades)
-
-    messages = []
-
-    open_count = int(trades["status"].eq("OPEN").sum()) if not trades.empty else 0
-
-    for display_name, ticker in list(ticker_options.items()):
-        if open_count >= int(max_open_trades):
-            messages.append("הגעת למקסימום עסקאות פתוחות.")
-            break
-
-        plans_to_try = []
-
-        try:
-            if mode in ["טווח בינוני 30-60 דקות", "שניהם"]:
-                df = fetch_intraday_yfinance(
-                    ticker=ticker,
-                    days_back=cfg.days_back,
-                    interval_minutes=cfg.bar_minutes,
-                )
-                latest_day_df = get_latest_trading_day(df)
-                if not latest_day_df.empty:
-                    plan = build_invest_now_plan(latest_day_df, cfg)
-                    plans_to_try.append(("30-60 דקות", plan))
-
-            if mode in ["טווח קצר 1-5 דקות", "שניהם"]:
-                micro_df = fetch_intraday_yfinance(
-                    ticker=ticker,
-                    days_back=min(int(cfg.days_back), 7),
-                    interval_minutes=1,
-                )
-                micro_latest_day_df = get_latest_trading_day(micro_df)
-                if not micro_latest_day_df.empty:
-                    micro_plan = build_micro_scalp_plan(micro_latest_day_df)
-                    plans_to_try.append(("1-5 דקות", micro_plan))
-
-        except Exception as e:
-            messages.append(f"{ticker}: שגיאה בסריקה: {str(e)[:120]}")
-            continue
-
-        for horizon, plan in plans_to_try:
-            if open_count >= int(max_open_trades):
-                break
-
-            score = int(plan.get("setup_score", 0) or 0)
-            if abs(score) < int(min_abs_score):
-                continue
-
-            if not trades.empty:
-                mask = get_open_trade_mask(trades, ticker=ticker, horizon=horizon)
-                if len(mask) > 0 and mask.any():
-                    continue
-
-            trade, message = create_paper_trade_from_plan(
-                ticker=ticker,
-                horizon=horizon,
-                plan=plan,
-                risk_dollars=float(risk_dollars),
-                max_notional=float(max_notional),
-                cost_pct_per_side=float(cost_pct_per_side),
-                fixed_fee_per_side=float(fixed_fee_per_side),
-                min_fee_per_side=float(min_fee_per_side),
-                max_cost_to_target_pct=float(max_cost_to_target_pct),
-            )
-
-            if trade is None:
-                if "דילוג אחרי עלויות" in message:
-                    messages.append(f"{ticker} | {horizon}: {message}")
-                continue
-
-            trades = pd.concat([trades, pd.DataFrame([trade])], ignore_index=True)
-            open_count += 1
-            messages.append(
-                f"נפתחה עסקת נייר: {ticker} | {horizon} | {trade['side']} | "
-                f"עלות משוערת ${trade['commission_per_trade']:.2f} | "
-                f"נטו צפוי ליעד ${trade['expected_net_to_target']:.2f}"
-            )
-
-            # One new trade per ticker per scan is enough.
-            break
-
-        time.sleep(0.25)
-
-    save_paper_trades(trades)
-    return trades, messages
-
-
-def paper_summary(trades: pd.DataFrame) -> dict:
-    if trades.empty:
-        return {
-            "open_trades": 0,
-            "closed_trades": 0,
-            "total_gross_pnl": 0.0,
-            "total_costs": 0.0,
-            "total_net_pnl": 0.0,
-            "closed_net_pnl": 0.0,
-            "win_rate": 0.0,
-        }
-
-    for col in PAPER_COLUMNS:
-        if col not in trades.columns:
-            trades[col] = np.nan
-
-    open_trades = trades[trades["status"].eq("OPEN")]
-    closed_trades = trades[trades["status"].eq("CLOSED")]
-
-    closed_count = len(closed_trades)
-    wins = int((closed_trades["net_pnl"].fillna(0).astype(float) > 0).sum()) if closed_count else 0
-
-    return {
-        "open_trades": int(len(open_trades)),
-        "closed_trades": int(closed_count),
-        "total_gross_pnl": float(trades["gross_pnl"].fillna(0).astype(float).sum()),
-        "total_costs": float(trades["total_trade_cost"].fillna(0).astype(float).sum()),
-        "total_net_pnl": float(trades["net_pnl"].fillna(0).astype(float).sum()),
-        "closed_net_pnl": float(closed_trades["net_pnl"].fillna(0).astype(float).sum()) if closed_count else 0.0,
-        "win_rate": float((wins / closed_count) * 100) if closed_count else 0.0,
-    }
-
-
-def paper_cost_summary_by_ticker(trades: pd.DataFrame) -> pd.DataFrame:
-    """
-    Aggregate gross PnL, costs and net PnL per ticker.
-    """
-    if trades.empty:
-        return pd.DataFrame()
-
-    for col in PAPER_COLUMNS:
-        if col not in trades.columns:
-            trades[col] = np.nan
-
-    out = (
-        trades.groupby("ticker")
-        .agg(
-            trades_count=("trade_id", "count"),
-            open_trades=("status", lambda s: int((s == "OPEN").sum())),
-            closed_trades=("status", lambda s: int((s == "CLOSED").sum())),
-            gross_pnl=("gross_pnl", "sum"),
-            total_costs=("total_trade_cost", "sum"),
-            net_pnl=("net_pnl", "sum"),
-            avg_commission_per_trade=("commission_per_trade", "mean"),
-            avg_cost_to_target_ratio_pct=("cost_to_target_ratio_pct", "mean"),
-        )
-        .reset_index()
-        .sort_values("net_pnl", ascending=False)
-    )
-
-    return out
-
-
 # ============================================================
-# Tabs
+# Styling
 # ============================================================
 
-tab_single, tab_all, tab_live, tab_invest_now, tab_paper, tab_help = st.tabs(
-    [
-        "🔎 מניה אחת",
-        "🚀 כמה מניות",
-        "⏱️ יום אחרון / כמעט זמן אמת",
-        "🎯 השקעה כעת",
-        "🧪 Paper Trading",
-        "📘 הסבר",
-    ]
+st.markdown(
+    """
+<style>
+html, body, [class*="css"] { direction: rtl; text-align: right; }
+.title-box {
+    background: linear-gradient(135deg,#111827,#1f2937,#374151);
+    color:white; padding:24px; border-radius:22px; margin-bottom:16px;
+    box-shadow:0 10px 24px rgba(0,0,0,.12);
+}
+.title-box h1 { margin:0; font-size:34px; }
+.title-box p { margin-top:8px; color:#d1d5db; }
+.card {
+    border:1px solid #e5e7eb; border-radius:18px; padding:14px 16px;
+    background:#fff; box-shadow:0 6px 14px rgba(0,0,0,.05); margin:8px 0;
+}
+.warn { background:#fff7ed; border:1px solid #fed7aa; color:#7c2d12; }
+.green-row {
+    background:#dcfce7; border:1px solid #86efac; border-radius:14px;
+    padding:10px; margin:6px 0; color:#064e3b;
+}
+.red-row {
+    background:#fee2e2; border:1px solid #fca5a5; border-radius:14px;
+    padding:10px; margin:6px 0; color:#7f1d1d;
+}
+.neutral-row {
+    background:#f9fafb; border:1px solid #e5e7eb; border-radius:14px;
+    padding:10px; margin:6px 0; color:#111827;
+}
+.small { color:#6b7280; font-size:13px; }
+.metric-note { font-size:12px; color:#6b7280; margin-top:-10px; }
+</style>
+""",
+    unsafe_allow_html=True,
 )
 
 
 # ============================================================
-# Single ticker
+# File helpers
 # ============================================================
 
-with tab_single:
-    st.subheader("🔎 בדיקת מניה אחת")
+def now_ny():
+    return pd.Timestamp.now(tz=NY_TZ)
 
-    col_a, col_b = st.columns([1, 2])
+def now_ny_iso():
+    return now_ny().isoformat()
 
-    with col_a:
-        selected_name = st.selectbox(
-            "בחר מניה / ETF",
-            options=list(DEFAULT_TICKERS.keys()),
-            index=0,
-        )
-        ticker = DEFAULT_TICKERS[selected_name]
+def safe_float(x, default=np.nan):
+    try:
+        if pd.isna(x):
+            return float(default)
+        return float(x)
+    except Exception:
+        return float(default)
 
-        st.markdown(
-            f"""
-<div class="card">
-<h3>{selected_name}</h3>
-<p class="small-muted">סימול: <strong>{ticker}</strong></p>
-<p>הבדיקה תמשוך נתוני intraday אחרונים מ־yfinance.</p>
-</div>
-""",
-            unsafe_allow_html=True,
-        )
+def normalize_ticker(t):
+    t = str(t or "").strip().upper()
+    if ":" in t:
+        t = t.split(":")[-1]
+    return t.replace(" ", "")
 
-        run_single = st.button(f"▶️ הרץ בדיקה על {ticker}", use_container_width=True)
-
-    with col_b:
-        st.markdown(
-            """
-<div class="card">
-<h3>מה נקבל?</h3>
-<p>סיווג פתיחת המסחר לפי עוצמה וצורה, ואז בדיקה סטטיסטית של מה קרה בהמשך היום.</p>
-</div>
-""",
-            unsafe_allow_html=True,
-        )
-
-    if run_single:
-        with st.spinner(f"מושך ומנתח נתונים עבור {ticker}..."):
-            try:
-                df, results, summary_by_type, summary_by_volume, eod_summary = run_history_for_ticker(
-                    ticker=ticker,
-                    cfg=cfg,
-                )
-
-                if results.empty:
-                    st.warning("לא נמצאו מספיק נתונים לניתוח. נסה פחות דקות/חלון פתיחה קצר יותר.")
+def read_json(path, default):
+    if not path.exists() or path.stat().st_size == 0:
+        return default
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(default, dict):
+            merged = json.loads(json.dumps(default))
+            for k, v in data.items():
+                if isinstance(v, dict) and isinstance(merged.get(k), dict):
+                    merged[k].update(v)
                 else:
-                    c1, c2, c3, c4 = st.columns(4)
-                    with c1:
-                        st.metric("ימי מסחר שנותחו", f"{len(results):,}")
-                    with c2:
-                        st.metric("סוגי פתיחה", f"{results['opening_type'].nunique()}")
-                    with c3:
-                        st.metric("ממוצע תנועה בפתיחה", f"{results['initial_move_pct'].mean():.2f}%")
-                    with c4:
-                        st.metric("ממוצע עד סוף יום", f"{results['eod_change_pct'].mean():.2f}%")
+                    merged[k] = v
+            return merged
+        return data
+    except Exception:
+        return default
 
-                    st.success("הניתוח הושלם ונשמר לקבצי CSV בתיקיית data.")
+def write_json(path, data):
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
-                    st.markdown("### גרף נרות אחרונים")
-                    fig = plot_candles(filter_regular_market_hours(df), title=f"{ticker} — נרות אחרונים")
-                    if fig:
-                        st.plotly_chart(fig, use_container_width=True)
+def load_tickers():
+    data = read_json(TICKERS_FILE, {"tickers": DEFAULT_TICKERS})
+    return sorted(set(normalize_ticker(x) for x in data.get("tickers", DEFAULT_TICKERS) if normalize_ticker(x)))
 
-                    st.markdown("### הסתברויות לפי סוג פתיחה")
-                    st.dataframe(summary_by_type, use_container_width=True, hide_index=True)
+def save_tickers(tickers):
+    write_json(TICKERS_FILE, {"tickers": sorted(set(normalize_ticker(x) for x in tickers if normalize_ticker(x)))})
 
-                    st.markdown("### סיכום סוף יום לפי סוג פתיחה")
-                    st.dataframe(eod_summary, use_container_width=True, hide_index=True)
+def load_costs():
+    return read_json(COSTS_FILE, DEFAULT_COSTS)
 
-                    st.markdown("### הסתברויות לפי סוג פתיחה + ווליום")
-                    st.dataframe(summary_by_volume, use_container_width=True, hide_index=True)
+def save_costs(costs):
+    write_json(COSTS_FILE, costs)
 
-                    st.markdown("### תוצאות יומיות גולמיות")
-                    st.dataframe(results.tail(100), use_container_width=True, hide_index=True)
+def load_units():
+    return read_json(UNITS_FILE, DEFAULT_UNITS)
 
-            except Exception as e:
-                st.error(f"שגיאה: {e}")
+def save_units(units):
+    write_json(UNITS_FILE, units)
+
+def load_rules():
+    return read_json(RULES_FILE, DEFAULT_RULES)
+
+def save_rules(rules):
+    write_json(RULES_FILE, rules)
+
+def empty_trades():
+    return pd.DataFrame(columns=TRADE_COLUMNS)
+
+def load_trades():
+    if not TRADES_FILE.exists() or TRADES_FILE.stat().st_size == 0:
+        return empty_trades()
+    try:
+        df = pd.read_csv(TRADES_FILE)
+    except Exception:
+        return empty_trades()
+
+    for col in TRADE_COLUMNS:
+        if col not in df.columns:
+            df[col] = np.nan
+    return df[TRADE_COLUMNS]
+
+def save_trades(df):
+    if df is None or df.empty:
+        empty_trades().to_csv(TRADES_FILE, index=False)
+        return
+    for col in TRADE_COLUMNS:
+        if col not in df.columns:
+            df[col] = np.nan
+    df[TRADE_COLUMNS].to_csv(TRADES_FILE, index=False)
+
+def clear_trades():
+    save_trades(empty_trades())
 
 
 # ============================================================
-# Batch
+# Data + indicators
 # ============================================================
 
-with tab_all:
-    st.subheader("🚀 בדיקה על כמה מניות")
-
-    st.markdown(
-        """
-<div class="card">
-בגלל שזו גרסה חינמית, עדיף לבחור 2-3 מניות בכל פעם כדי לא להעמיס על yfinance.
-</div>
-""",
-        unsafe_allow_html=True,
+@st.cache_data(show_spinner=False, ttl=20)
+def fetch_1m(ticker, days=7):
+    ticker = normalize_ticker(ticker)
+    df = yf.download(
+        ticker,
+        period=f"{min(int(days), 7)}d",
+        interval="1m",
+        progress=False,
+        auto_adjust=True,
+        prepost=False,
+        threads=False,
     )
-
-    selected_batch_names = st.multiselect(
-        "בחר מניות",
-        options=list(DEFAULT_TICKERS.keys()),
-        default=["Apple", "Nvidia", "Tesla"],
-    )
-    selected_batch_tickers = [DEFAULT_TICKERS[name] for name in selected_batch_names]
-
-    run_all = st.button("▶️ הרץ בדיקה על הבחירה", use_container_width=True)
-
-    if run_all:
-        if not selected_batch_tickers:
-            st.warning("לא נבחרו מניות.")
-        else:
-            combined_best = []
-            combined_eod = []
-
-            progress = st.progress(0)
-            status = st.empty()
-
-            for i, ticker in enumerate(selected_batch_tickers, start=1):
-                status.info(f"מריץ {ticker} ({i}/{len(selected_batch_tickers)})...")
-
-                try:
-                    df, results, summary_by_type, summary_by_volume, eod_summary = run_history_for_ticker(
-                        ticker=ticker,
-                        cfg=cfg,
-                    )
-
-                    if not summary_by_type.empty:
-                        temp = summary_by_type.copy()
-                        temp.insert(0, "ticker", ticker)
-                        best = (
-                            temp.sort_values("probability_pct", ascending=False)
-                            .groupby(["ticker", "opening_type"], as_index=False)
-                            .head(1)
-                        )
-                        combined_best.append(best)
-
-                    if not eod_summary.empty:
-                        temp_eod = eod_summary.copy()
-                        temp_eod.insert(0, "ticker", ticker)
-                        combined_eod.append(temp_eod)
-
-                    time.sleep(1)
-
-                except Exception as e:
-                    st.error(f"שגיאה ב־{ticker}: {e}")
-
-                progress.progress(i / len(selected_batch_tickers))
-
-            status.success("הבדיקה הסתיימה.")
-
-            if combined_best:
-                combined_best_df = pd.concat(combined_best, ignore_index=True)
-                combined_best_df.to_csv(DATA_DIR / "ALL_best_probabilities_by_ticker.csv", index=False)
-
-                st.markdown("### התוצאה הכי נפוצה לכל סוג פתיחה בכל מניה")
-                st.dataframe(combined_best_df, use_container_width=True, hide_index=True)
-
-            if combined_eod:
-                combined_eod_df = pd.concat(combined_eod, ignore_index=True)
-                combined_eod_df.to_csv(DATA_DIR / "ALL_eod_summary_by_ticker.csv", index=False)
-
-                st.markdown("### סיכום סוף יום משולב")
-                st.dataframe(combined_eod_df, use_container_width=True, hide_index=True)
-
-
-# ============================================================
-# Live / latest day
-# ============================================================
-
-with tab_live:
-    st.subheader("⏱️ יום אחרון / כמעט זמן אמת")
-
-    st.markdown(
-        """
-<div class="card">
-המסך הזה מושך את הנתונים האחרונים הזמינים ב־yfinance,
-בודק את יום המסחר האחרון שקיים בנתונים, ומשווה אותו להיסטוריה הקצרה שנשמרה.
-</div>
-""",
-        unsafe_allow_html=True,
-    )
-
-    col_live_1, col_live_2 = st.columns([1, 2])
-
-    with col_live_1:
-        live_name = st.selectbox(
-            "בחר מניה / ETF",
-            options=list(DEFAULT_TICKERS.keys()),
-            index=0,
-            key="live_selectbox",
-        )
-        live_ticker = DEFAULT_TICKERS[live_name]
-
-        refresh_now = st.button("🔄 בדוק עכשיו", use_container_width=True)
-        build_history_now = st.button("🧠 בנה היסטוריה עכשיו", use_container_width=True)
-        auto_refresh = st.checkbox("רענון אוטומטי כל 60 שניות", value=False)
-
-    with col_live_2:
-        st.markdown(
-            f"""
-<div class="card">
-<h3>{live_name} — {live_ticker}</h3>
-<p>המערכת תבדוק את יום המסחר האחרון בנתונים ותשווה לסוגי פתיחה דומים.</p>
-</div>
-""",
-            unsafe_allow_html=True,
-        )
-
-    if build_history_now:
-        with st.spinner(f"בונה היסטוריה עבור {live_ticker}..."):
-            try:
-                run_history_for_ticker(ticker=live_ticker, cfg=cfg)
-                st.success("היסטוריה נבנתה ונשמרה.")
-            except Exception as e:
-                st.error(f"שגיאה בבניית היסטוריה: {e}")
-
-    if refresh_now or auto_refresh:
-        try:
-            df = fetch_intraday_yfinance(
-                ticker=live_ticker,
-                days_back=cfg.days_back,
-                interval_minutes=cfg.bar_minutes,
-            )
-
-            latest_day_df = get_latest_trading_day(df)
-            current_info = classify_current_opening(latest_day_df, cfg)
-
-            if current_info is None:
-                st.warning("אין מספיק נתונים מהיום האחרון.")
-            else:
-                c1, c2, c3, c4 = st.columns(4)
-                with c1:
-                    st.metric("תאריך", current_info["date"])
-                with c2:
-                    st.metric("מחיר פתיחה", f"{current_info['open_price']:.2f}")
-                with c3:
-                    st.metric("מחיר אחרון", f"{current_info['current_price']:.2f}")
-                with c4:
-                    st.metric("סוג פתיחה", current_info["opening_type"])
-
-                if not current_info["is_complete_window"]:
-                    st.warning(
-                        f"חלון הפתיחה עדיין לא מלא: "
-                        f"{current_info['bars_count']}/{current_info['expected_bars']} נרות."
-                    )
-                else:
-                    st.success("חלון הפתיחה הושלם.")
-
-                st.markdown("### מה קרה היום בפועל")
-                today_status = build_today_status(latest_day_df, cfg)
-                if today_status is not None:
-                    t1, t2, t3, t4 = st.columns(4)
-                    with t1:
-                        st.metric("שינוי מהפתיחה", f"{today_status['current_move_pct']:.2f}%")
-                    with t2:
-                        st.metric("גבוה יומי", f"{today_status['day_high']:.2f}")
-                    with t3:
-                        st.metric("נמוך יומי", f"{today_status['day_low']:.2f}")
-                    with t4:
-                        st.metric("מצב אחרי הפתיחה", today_status["today_after_status"])
-
-                    st.dataframe(
-                        pd.DataFrame([today_status]),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-
-                st.markdown("### פרטי הפתיחה")
-                st.json(current_info)
-
-                st.markdown("### גרף יום אחרון")
-                fig = plot_candles(latest_day_df, title=f"{live_ticker} — יום אחרון")
-                if fig:
-                    st.plotly_chart(fig, use_container_width=True)
-
-                summary_by_type = load_summary_file(live_ticker)
-
-                if summary_by_type.empty:
-                    st.warning("לא נמצאה היסטוריה שמורה. לחץ על ״בנה היסטוריה עכשיו״.")
-                else:
-                    match = compare_current_to_history(current_info, summary_by_type)
-                    if match.empty:
-                        st.warning(f"אין מספיק מקרים היסטוריים עבור: {current_info['opening_type']}")
-                    else:
-                        st.markdown("### מה קרה בעבר במקרים דומים?")
-                        st.dataframe(match, use_container_width=True, hide_index=True)
-
-                        fig_prob = plot_probability_bar(summary_by_type, current_info["opening_type"])
-                        if fig_prob:
-                            st.plotly_chart(fig_prob, use_container_width=True)
-
-                        st.markdown("### תוכנית לימודית להיום — לא המלצת מסחר")
-                        today_status = build_today_status(latest_day_df, cfg)
-                        plan = build_educational_trade_plan(current_info, today_status, match, cfg)
-
-                        if plan["bias"] == "LONG_WATCH":
-                            st.success(plan["title_he"])
-                        elif plan["bias"] == "SHORT_WATCH":
-                            st.error(plan["title_he"])
-                        else:
-                            st.warning(plan["title_he"])
-
-                        p1, p2, p3, p4 = st.columns(4)
-                        with p1:
-                            st.metric("כיוון", plan["direction_he"])
-                        with p2:
-                            st.metric("ביטחון", plan["confidence_he"])
-                        with p3:
-                            st.metric("לונג היסטורי", f"{plan['long_probability']:.1f}%")
-                        with p4:
-                            st.metric("שורט היסטורי", f"{plan['short_probability']:.1f}%")
-
-                        st.markdown(
-                            f"""
-<div class="card">
-<h3>תוכנית בדמו בלבד</h3>
-<p><strong>אזור כניסה:</strong> {plan['entry_zone']}</p>
-<p><strong>טריגר:</strong> {plan['trigger']}</p>
-<p><strong>סטופ:</strong> {plan['stop']}</p>
-<p><strong>יעד ראשון:</strong> {plan['target_1']}</p>
-<p><strong>יעד שני:</strong> {plan['target_2']}</p>
-<p><strong>זמן החזקה:</strong> {plan['time_plan']}</p>
-<p><strong>למה:</strong> {plan['reason']}</p>
-<p class="small-muted">זה אינו ייעוץ השקעות ואינו הוראת קנייה/מכירה. להשתמש רק ללמידה ובדמו.</p>
-</div>
-""",
-                            unsafe_allow_html=True,
-                        )
-
-        except Exception as e:
-            st.error(f"שגיאה: {e}")
-
-        if auto_refresh:
-            time.sleep(60)
-            st.rerun()
-
-
-
-
-def scan_ticker_list_for_now(
-    ticker_options: dict[str, str],
-    cfg: AnalyzerConfig,
-) -> pd.DataFrame:
-    """
-    Scan all tickers in the current list and rank current educational scenarios.
-    """
-    rows = []
-
-    for display_name, ticker in list(ticker_options.items()):
-        try:
-            df = fetch_intraday_yfinance(
-                ticker=ticker,
-                days_back=cfg.days_back,
-                interval_minutes=cfg.bar_minutes,
-            )
-            latest_day_df = get_latest_trading_day(df)
-
-            if latest_day_df.empty:
-                rows.append({
-                    "name": display_name,
-                    "ticker": ticker,
-                    "direction": "אין נתונים",
-                    "bias": "NO_DATA",
-                    "score": 0,
-                    "quality": "N/A",
-                    "micro_direction": "N/A",
-                    "micro_bias": "N/A",
-                    "micro_score": 0,
-                    "micro_quality": "N/A",
-                    "current_price": np.nan,
-                    "change_from_open_pct": np.nan,
-                    "rsi14": np.nan,
-                    "relative_volume": np.nan,
-                    "entry_zone": "",
-                    "trigger": "",
-                    "stop": "",
-                    "target_1": "",
-                    "target_2": "",
-                    "reason": "לא נמצאו נתונים זמינים.",
-                })
-                continue
-
-            plan = build_invest_now_plan(latest_day_df, cfg)
-
-            try:
-                micro_df = fetch_intraday_yfinance(
-                    ticker=ticker,
-                    days_back=min(int(cfg.days_back), 7),
-                    interval_minutes=1,
-                )
-                micro_latest_day_df = get_latest_trading_day(micro_df)
-                micro_plan = build_micro_scalp_plan(micro_latest_day_df)
-            except Exception:
-                micro_plan = {
-                    "direction_he": "לא זמין",
-                    "bias": "MICRO_ERROR",
-                    "setup_score": 0,
-                    "setup_quality": "N/A",
-                }
-
-            rows.append({
-                "name": display_name,
-                "ticker": ticker,
-                "direction": plan.get("direction_he", ""),
-                "bias": plan.get("bias", ""),
-                "score": plan.get("setup_score", 0),
-                "quality": plan.get("setup_quality", ""),
-                "micro_direction": micro_plan.get("direction_he", ""),
-                "micro_bias": micro_plan.get("bias", ""),
-                "micro_score": micro_plan.get("setup_score", 0),
-                "micro_quality": micro_plan.get("setup_quality", ""),
-                "current_price": plan.get("current_price", np.nan),
-                "change_from_open_pct": plan.get("current_move_pct", np.nan),
-                "rsi14": plan.get("rsi14", np.nan),
-                "relative_volume": plan.get("relative_volume", np.nan),
-                "entry_zone": plan.get("entry_zone", ""),
-                "trigger": plan.get("trigger", ""),
-                "stop": plan.get("stop", ""),
-                "target_1": plan.get("target_1", ""),
-                "target_2": plan.get("target_2", ""),
-                "reason": plan.get("reason", ""),
-            })
-
-            time.sleep(0.25)
-
-        except Exception as e:
-            rows.append({
-                "name": display_name,
-                "ticker": ticker,
-                "direction": "שגיאה",
-                "bias": "ERROR",
-                "score": 0,
-                "quality": "N/A",
-                "current_price": np.nan,
-                "change_from_open_pct": np.nan,
-                "rsi14": np.nan,
-                "relative_volume": np.nan,
-                "entry_zone": "",
-                "trigger": "",
-                "stop": "",
-                "target_1": "",
-                "target_2": "",
-                "reason": str(e)[:200],
-            })
-
-    if not rows:
+    if df is None or df.empty:
         return pd.DataFrame()
 
-    out = pd.DataFrame(rows)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [str(c[0]).lower() for c in df.columns]
+    else:
+        df.columns = [str(c).lower() for c in df.columns]
 
-    def rank_bias(row):
-        bias = row.get("bias", "")
-        score = abs(float(row.get("score", 0) or 0))
-        if bias in ["LONG_WATCH", "SHORT_WATCH"]:
-            return 100 + score
-        if bias == "NO_TRADE":
-            return 10 + score
-        return 0
+    required = ["open", "high", "low", "close", "volume"]
+    if not all(c in df.columns for c in required):
+        return pd.DataFrame()
 
-    out["rank"] = out.apply(rank_bias, axis=1)
-    out = out.sort_values(["rank", "score"], ascending=[False, False])
-    out = out.drop(columns=["rank"])
+    df = df[required].dropna()
 
-    return out
+    if df.index.tz is None:
+        df.index = df.index.tz_localize("UTC").tz_convert(NY_TZ)
+    else:
+        df.index = df.index.tz_convert(NY_TZ)
+
+    df = df.between_time("09:30", "16:00")
+    return df
+
+def latest_session(df):
+    if df is None or df.empty:
+        return pd.DataFrame()
+    d = df.copy().sort_index()
+    last_date = d.index[-1].date()
+    return d[d.index.date == last_date]
+
+def add_indicators(df):
+    d = df.copy().sort_index()
+
+    for span in [3, 5, 9, 21, 50]:
+        d[f"ema{span}"] = d["close"].ewm(span=span, adjust=False).mean()
+        d[f"ema{span}_slope"] = d[f"ema{span}"].diff()
+        d[f"ema{span}_curv"] = d[f"ema{span}_slope"].diff()
+
+    typical = (d["high"] + d["low"] + d["close"]) / 3
+    d["vwap"] = (typical * d["volume"]).cumsum() / d["volume"].replace(0, np.nan).cumsum()
+    d["vwap_slope"] = d["vwap"].diff()
+    d["vwap_curv"] = d["vwap_slope"].diff()
+
+    delta = d["close"].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    for p in [3, 7, 14]:
+        avg_gain = gain.ewm(alpha=1 / p, adjust=False, min_periods=max(2, p // 2)).mean()
+        avg_loss = loss.ewm(alpha=1 / p, adjust=False, min_periods=max(2, p // 2)).mean()
+        rs = avg_gain / avg_loss.replace(0, np.nan)
+        d[f"rsi{p}"] = 100 - (100 / (1 + rs))
+        d[f"rsi{p}_slope"] = d[f"rsi{p}"].diff()
+        d[f"rsi{p}_curv"] = d[f"rsi{p}_slope"].diff()
+
+    ema12 = d["close"].ewm(span=12, adjust=False).mean()
+    ema26 = d["close"].ewm(span=26, adjust=False).mean()
+    d["macd"] = ema12 - ema26
+    d["macd_signal"] = d["macd"].ewm(span=9, adjust=False).mean()
+    d["macd_hist"] = d["macd"] - d["macd_signal"]
+    d["macd_hist_slope"] = d["macd_hist"].diff()
+    d["macd_hist_curv"] = d["macd_hist_slope"].diff()
+
+    d["range"] = d["high"] - d["low"]
+    d["atr3"] = d["range"].rolling(3, min_periods=2).mean()
+    d["atr14"] = d["range"].rolling(14, min_periods=5).mean()
+    d["vol_ma5"] = d["volume"].rolling(5, min_periods=2).mean()
+    d["vol_ma20"] = d["volume"].rolling(20, min_periods=5).mean()
+    d["rel_vol5"] = d["volume"] / d["vol_ma5"].replace(0, np.nan)
+    d["rel_vol20"] = d["volume"] / d["vol_ma20"].replace(0, np.nan)
+    d["mom2_pct"] = (d["close"] / d["close"].shift(2) - 1) * 100
+    d["mom5_pct"] = (d["close"] / d["close"].shift(5) - 1) * 100
+    d["mom30_pct"] = (d["close"] / d["close"].shift(30) - 1) * 100
+    return d
 
 
 # ============================================================
-# Invest now tab
+# Costs and units
 # ============================================================
 
-with tab_invest_now:
-    st.subheader("🎯 השקעה כעת — תרחיש לימודי לפי הרגע הנוכחי")
+def side_cost(notional, costs):
+    variable = abs(float(notional)) * (float(costs["cost_pct_per_side"]) / 100)
+    raw = variable + float(costs["fixed_fee_per_side"])
+    return float(max(raw, float(costs["min_fee_per_side"])))
 
-    st.markdown(
-        """
-<div class="warning-card">
-<strong>חשוב:</strong>
-המסך הזה אינו ייעוץ השקעות ואינו הוראת קנייה/מכירה.
-הוא בונה תרחיש לימודי לפי נתונים זמינים: גם טווח קצר מאוד 1-5 דקות וגם טווח 30-60 דקות.
-לעבוד בדמו בלבד עד שיש לך שיטה מוכחת.
-</div>
-""",
-        unsafe_allow_html=True,
-    )
+def estimate_costs(entry, exit_price, qty, costs):
+    entry_notional = abs(float(entry) * float(qty))
+    exit_notional = abs(float(exit_price) * float(qty))
+    entry_cost = side_cost(entry_notional, costs)
+    exit_cost = side_cost(exit_notional, costs)
+    return entry_cost, exit_cost, entry_cost + exit_cost
 
-    col_now_1, col_now_2 = st.columns([1, 2])
+def units_for_score(score, units_cfg):
+    score = int(max(1, min(8, int(score))))
+    return float(units_cfg["score_units"].get(str(score), 0.0))
 
-    with col_now_1:
-        ticker_options_now = get_all_ticker_options()
+def position_size(score, entry, units_cfg):
+    unit_mult = units_for_score(score, units_cfg)
+    notional = min(float(units_cfg["base_unit_dollars"]) * unit_mult, float(units_cfg["max_trade_dollars"]))
+    qty = notional / float(entry) if entry > 0 else 0
+    return float(qty), float(notional), float(unit_mult)
 
-        new_ticker_input = st.text_input(
-            "הוסף סימול מניה לרשימה",
-            placeholder="לדוגמה: PLTR / SMCI / MSTR / QQQ",
-            key="new_ticker_input",
-        )
+def cost_tradeoff(side, entry, target, qty, costs):
+    if side == "LONG":
+        expected_gross = (target - entry) * qty
+    else:
+        expected_gross = (entry - target) * qty
 
-        add_ticker_clicked = st.button("➕ הוסף לרשימה", use_container_width=True)
+    _, _, expected_cost = estimate_costs(entry, target, qty, costs)
+    expected_net = expected_gross - expected_cost
 
-        if add_ticker_clicked:
-            cleaned_ticker = normalize_ticker(new_ticker_input)
-            if not cleaned_ticker:
-                st.warning("לא הוקלד סימול.")
-            else:
-                added = save_custom_ticker(cleaned_ticker)
-                if added:
-                    st.success(f"{cleaned_ticker} נוסף לרשימה.")
-                    st.rerun()
-                else:
-                    st.info(f"{cleaned_ticker} כבר קיים ברשימה או לא תקין.")
+    if expected_gross <= 0:
+        return False, expected_gross, expected_cost, expected_net, "הרווח הצפוי ליעד לא חיובי."
 
-        ticker_options_now = get_all_ticker_options()
+    ratio = (expected_cost / expected_gross) * 100
+    max_ratio = float(costs["max_cost_to_target_pct"])
 
-        now_name = st.selectbox(
-            "בחר מניה / ETF לניתוח עכשיו",
-            options=list(ticker_options_now.keys()),
-            index=0,
-            key="invest_now_selectbox",
-        )
-        now_ticker = ticker_options_now[now_name]
+    if expected_net <= 0:
+        return False, expected_gross, expected_cost, expected_net, "לא משתלם אחרי עלויות."
+    if ratio > max_ratio:
+        return False, expected_gross, expected_cost, expected_net, f"העלות {ratio:.1f}% מהרווח הצפוי — גבוה מדי."
 
-        now_refresh = st.button("🔄 נתח עכשיו", use_container_width=True)
-        scan_now_list = st.button("📋 סרוק את כל הרשימה ומצא הזדמנויות", use_container_width=True)
-        scan_auto_refresh = st.checkbox(
-            "סריקה אוטומטית של כל הרשימה כל 30 שניות",
-            value=False,
-            key="scan_auto_refresh_30s",
-        )
-        now_auto_refresh = st.checkbox("רענון אוטומטי כל 20 שניות", value=False, key="invest_now_auto")
+    return True, expected_gross, expected_cost, expected_net, "משתלם אחרי עלויות."
 
-    with col_now_2:
-        st.markdown(
-            f"""
-<div class="card">
-<h3>{now_name} — {now_ticker}</h3>
-<p>
-המערכת תבדוק את הנתונים האחרונים הזמינים ותייצר תרחיש לימודי:
-לונג / שורט / המתנה, אזור כניסה, טריגר, סטופ ויעדים.
-אפשר גם להוסיף סימול מניה ידנית, לסרוק את כל הרשימה, ולהפעיל סריקה אוטומטית כל 30 שניות.
-</p>
-<p class="small-muted">
-ב־yfinance הנתונים לא בהכרח בזמן אמת מלא ויכולים להיות מושהים.
-</p>
-</div>
-""",
-            unsafe_allow_html=True,
-        )
+def pnl_for_trade(row, current_price):
+    entry = safe_float(row["entry_price"], 0)
+    qty = safe_float(row["quantity"], 0)
+    costs = {
+        "cost_pct_per_side": safe_float(row["cost_pct_per_side"], DEFAULT_COSTS["cost_pct_per_side"]),
+        "fixed_fee_per_side": safe_float(row["fixed_fee_per_side"], DEFAULT_COSTS["fixed_fee_per_side"]),
+        "min_fee_per_side": safe_float(row["min_fee_per_side"], DEFAULT_COSTS["min_fee_per_side"]),
+    }
 
-    if scan_now_list or scan_auto_refresh:
-        with st.spinner("סורק את כל הרשימה ומחפש לונג/שורט אפשריים עכשיו..."):
-            scan_results = scan_ticker_list_for_now(
-                ticker_options=get_all_ticker_options(),
-                cfg=cfg,
-            )
+    if str(row["side"]) == "LONG":
+        gross = (float(current_price) - entry) * qty
+    else:
+        gross = (entry - float(current_price)) * qty
 
-        if scan_results.empty:
-            st.warning("לא נמצאו תוצאות לסריקה.")
+    entry_cost, exit_cost, total_cost = estimate_costs(entry, current_price, qty, costs)
+    net = gross - total_cost
+    notional = abs(entry * qty)
+    net_pct = (net / notional) * 100 if notional > 0 else 0
+
+    return {
+        "entry_cost": entry_cost,
+        "exit_cost": exit_cost,
+        "total_cost": total_cost,
+        "gross_pnl": gross,
+        "net_pnl": net,
+        "net_pnl_pct": net_pct,
+    }
+
+
+# ============================================================
+# Signal logic
+# ============================================================
+
+def score_side_fast(d, side):
+    if len(d) < 3:
+        return 0, ["פחות מ־3 נרות"]
+
+    last = d.iloc[-1]
+    last3 = d.tail(3)
+    close = safe_float(last["close"])
+    score = 0
+    reasons = []
+
+    green = int((last3["close"] > last3["open"]).sum())
+    red = int((last3["close"] < last3["open"]).sum())
+
+    if side == "LONG":
+        checks = [
+            (close > safe_float(last["ema3"]) > safe_float(last["ema5"]), 2, "מחיר מעל EMA3/5"),
+            (close > safe_float(last["ema9"]), 1, "מעל EMA9"),
+            (close > safe_float(last["vwap"]), 1, "מעל VWAP"),
+            (green >= 2, 1, "2 מתוך 3 נרות ירוקים"),
+            (safe_float(last["mom2_pct"], 0) > 0.03, 1, "מומנטום קצר חיובי"),
+            (safe_float(last["ema3_slope"], 0) > 0 and safe_float(last["ema5_slope"], 0) > 0, 1, "שיפוע EMA חיובי"),
+            (safe_float(last["ema3_curv"], 0) > 0 or safe_float(last["rsi3_slope"], 0) > 0, 1, "שיפור בנגזרת/עקמומיות"),
+            (42 <= safe_float(last["rsi3"], 50) <= 82, 1, "RSI3 תומך"),
+            (safe_float(last["rel_vol5"], 1) >= 1.05, 1, "ווליום תומך"),
+        ]
+    else:
+        checks = [
+            (close < safe_float(last["ema3"]) < safe_float(last["ema5"]), 2, "מחיר מתחת EMA3/5"),
+            (close < safe_float(last["ema9"]), 1, "מתחת EMA9"),
+            (close < safe_float(last["vwap"]), 1, "מתחת VWAP"),
+            (red >= 2, 1, "2 מתוך 3 נרות אדומים"),
+            (safe_float(last["mom2_pct"], 0) < -0.03, 1, "מומנטום קצר שלילי"),
+            (safe_float(last["ema3_slope"], 0) < 0 and safe_float(last["ema5_slope"], 0) < 0, 1, "שיפוע EMA שלילי"),
+            (safe_float(last["ema3_curv"], 0) < 0 or safe_float(last["rsi3_slope"], 0) < 0, 1, "היחלשות בנגזרת/עקמומיות"),
+            (18 <= safe_float(last["rsi3"], 50) <= 58, 1, "RSI3 תומך בשורט"),
+            (safe_float(last["rel_vol5"], 1) >= 1.05, 1, "ווליום תומך"),
+        ]
+
+    for ok, pts, reason in checks:
+        if ok:
+            score += pts
+            reasons.append(reason)
+
+    return int(max(1, min(8, score))), reasons
+
+def score_side_half(d, side):
+    if len(d) < 12:
+        return 0, ["פחות מדי נרות לחצי שעה"]
+
+    last = d.iloc[-1]
+    close = safe_float(last["close"])
+    score = 0
+    reasons = []
+
+    if side == "LONG":
+        checks = [
+            (close > safe_float(last["ema9"]) > safe_float(last["ema21"]), 2, "מעל EMA9/21"),
+            (close > safe_float(last["ema50"]), 1, "מעל EMA50"),
+            (close > safe_float(last["vwap"]), 1, "מעל VWAP"),
+            (safe_float(last["ema9_slope"], 0) > 0 and safe_float(last["ema21_slope"], 0) > 0, 1, "שיפוע EMA חיובי"),
+            (safe_float(last["ema9_curv"], 0) > 0 or safe_float(last["macd_hist_curv"], 0) > 0, 1, "עקמומיות חיובית"),
+            (safe_float(last["macd_hist_slope"], 0) > 0 or safe_float(last["rsi14_slope"], 0) > 0, 1, "אינדיקטורים משתפרים"),
+            (safe_float(last["mom30_pct"], 0) > 0.05, 1, "מומנטום 30 דק׳ חיובי"),
+            (45 <= safe_float(last["rsi14"], 50) <= 75, 1, "RSI14 תומך"),
+            (safe_float(last["rel_vol20"], 1) >= 1, 1, "ווליום תומך"),
+        ]
+    else:
+        checks = [
+            (close < safe_float(last["ema9"]) < safe_float(last["ema21"]), 2, "מתחת EMA9/21"),
+            (close < safe_float(last["ema50"]), 1, "מתחת EMA50"),
+            (close < safe_float(last["vwap"]), 1, "מתחת VWAP"),
+            (safe_float(last["ema9_slope"], 0) < 0 and safe_float(last["ema21_slope"], 0) < 0, 1, "שיפוע EMA שלילי"),
+            (safe_float(last["ema9_curv"], 0) < 0 or safe_float(last["macd_hist_curv"], 0) < 0, 1, "עקמומיות שלילית"),
+            (safe_float(last["macd_hist_slope"], 0) < 0 or safe_float(last["rsi14_slope"], 0) < 0, 1, "אינדיקטורים נחלשים"),
+            (safe_float(last["mom30_pct"], 0) < -0.05, 1, "מומנטום 30 דק׳ שלילי"),
+            (25 <= safe_float(last["rsi14"], 50) <= 55, 1, "RSI14 תומך בשורט"),
+            (safe_float(last["rel_vol20"], 1) >= 1, 1, "ווליום תומך"),
+        ]
+
+    for ok, pts, reason in checks:
+        if ok:
+            score += pts
+            reasons.append(reason)
+
+    return int(max(1, min(8, score))), reasons
+
+def make_signal(ticker, mode):
+    df = latest_session(fetch_1m(ticker))
+    if df.empty:
+        return {"signal": "WAIT", "ticker": ticker, "mode": mode, "score": 0, "reason": "אין נתונים"}
+
+    d = add_indicators(df).dropna(subset=["close"])
+    if d.empty:
+        return {"signal": "WAIT", "ticker": ticker, "mode": mode, "score": 0, "reason": "אין אינדיקטורים"}
+
+    if mode == "מהירה":
+        ls, lr = score_side_fast(d, "LONG")
+        ss, sr = score_side_fast(d, "SHORT")
+        atr = safe_float(d.iloc[-1]["atr3"], safe_float(d.iloc[-1]["close"]) * 0.001)
+        stop_mult, target_mult = 0.85, 1.15
+    else:
+        ls, lr = score_side_half(d, "LONG")
+        ss, sr = score_side_half(d, "SHORT")
+        atr = safe_float(d.iloc[-1]["atr14"], safe_float(d.iloc[-1]["close"]) * 0.002)
+        stop_mult, target_mult = 1.20, 1.90
+
+    entry = safe_float(d.iloc[-1]["close"])
+    atr = max(atr, entry * 0.0008)
+
+    if ls >= ss and ls >= 3:
+        side, score, reasons = "LONG", ls, lr
+        stop = entry - stop_mult * atr
+        target = entry + target_mult * atr
+    elif ss > ls and ss >= 3:
+        side, score, reasons = "SHORT", ss, sr
+        stop = entry + stop_mult * atr
+        target = entry - target_mult * atr
+    else:
+        return {"signal": "WAIT", "ticker": ticker, "mode": mode, "score": max(ls, ss), "reason": f"לונג {ls}, שורט {ss} — אין יתרון ברור"}
+
+    return {
+        "signal": side,
+        "ticker": normalize_ticker(ticker),
+        "mode": mode,
+        "score": int(score),
+        "entry": float(entry),
+        "stop": float(stop),
+        "target": float(target),
+        "reason": " | ".join(reasons),
+    }
+
+
+# ============================================================
+# Trade lifecycle
+# ============================================================
+
+def trade_age_minutes(row):
+    try:
+        entry = pd.Timestamp(row["entry_time"])
+        if entry.tzinfo is None:
+            entry = entry.tz_localize(NY_TZ)
         else:
-            opportunities = scan_results[scan_results["bias"].isin(["LONG_WATCH", "SHORT_WATCH"])].copy()
-            wait_list = scan_results[scan_results["bias"].eq("NO_TRADE")].copy()
+            entry = entry.tz_convert(NY_TZ)
+        return max(0.0, (now_ny() - entry).total_seconds() / 60)
+    except Exception:
+        return 0.0
 
-            st.markdown("### מניות / ETF שיש להן תרחיש לונג או שורט עכשיו")
+def min_hold_for_mode(mode, rules):
+    if str(mode) == "מהירה":
+        return float(rules["min_hold_fast_minutes"])
+    return float(rules["min_hold_half_hour_minutes"])
 
-            if opportunities.empty:
-                st.warning("כרגע אין מניות עם תרחיש לונג/שורט מספיק נקי לפי הפילטרים.")
-            else:
-                st.dataframe(
-                    opportunities[
-                        [
-                            "ticker",
-                            "direction",
-                            "score",
-                            "quality",
-                            "micro_direction",
-                            "micro_score",
-                            "micro_quality",
-                            "current_price",
-                            "change_from_open_pct",
-                            "rsi14",
-                            "relative_volume",
-                            "entry_zone",
-                            "trigger",
-                            "stop",
-                            "target_1",
-                            "target_2",
-                        ]
-                    ],
-                    use_container_width=True,
-                    hide_index=True,
-                )
+def has_open_trade(trades, ticker, mode):
+    if trades.empty:
+        return False
+    return bool((trades["status"].eq("OPEN") & trades["ticker"].astype(str).eq(ticker) & trades["mode"].astype(str).eq(mode)).any())
 
-            with st.expander("הצג גם מניות שכרגע עדיף להמתין בהן"):
-                st.dataframe(
-                    wait_list[
-                        [
-                            "ticker",
-                            "direction",
-                            "score",
-                            "quality",
-                            "micro_direction",
-                            "micro_score",
-                            "micro_quality",
-                            "current_price",
-                            "change_from_open_pct",
-                            "reason",
-                        ]
-                    ],
-                    use_container_width=True,
-                    hide_index=True,
-                )
+def in_cooldown(trades, ticker, mode, rules):
+    if trades.empty:
+        return False, ""
+    closed = trades[
+        trades["status"].eq("CLOSED")
+        & trades["ticker"].astype(str).eq(ticker)
+        & trades["mode"].astype(str).eq(mode)
+    ].copy()
+    if closed.empty:
+        return False, ""
 
-            with st.expander("כל תוצאות הסריקה"):
-                st.dataframe(scan_results, use_container_width=True, hide_index=True)
+    closed = closed.dropna(subset=["exit_time"])
+    if closed.empty:
+        return False, ""
 
-        if scan_auto_refresh:
-            time.sleep(30)
-            st.rerun()
+    try:
+        last_exit = pd.Timestamp(closed["exit_time"].iloc[-1])
+        if last_exit.tzinfo is None:
+            last_exit = last_exit.tz_localize(NY_TZ)
+        else:
+            last_exit = last_exit.tz_convert(NY_TZ)
+        minutes = (now_ny() - last_exit).total_seconds() / 60
+        needed = float(rules["cooldown_after_close_minutes"])
+        if minutes < needed:
+            return True, f"Cooldown: נסגרה עסקה לפני {minutes:.1f} דק׳, מחכים {needed:.0f} דק׳."
+    except Exception:
+        return False, ""
 
-    if now_refresh or now_auto_refresh:
+    return False, ""
+
+def open_trade(signal, min_score):
+    trades = load_trades()
+    costs = load_costs()
+    units = load_units()
+    rules = load_rules()
+
+    ticker = normalize_ticker(signal["ticker"])
+    mode = signal["mode"]
+    side = signal["signal"]
+    score = int(signal["score"])
+
+    if side not in ["LONG", "SHORT"]:
+        return False, f"{ticker}: אין איתות."
+    if score < int(min_score):
+        return False, f"{ticker}: ניקוד {score} נמוך מהמינימום."
+    if has_open_trade(trades, ticker, mode):
+        return False, f"{ticker}: כבר יש עסקה פתוחה ב־{mode}."
+
+    cd, msg = in_cooldown(trades, ticker, mode, rules)
+    if cd:
+        return False, f"{ticker}: {msg}"
+
+    entry = float(signal["entry"])
+    stop = float(signal["stop"])
+    target = float(signal["target"])
+
+    qty, notional, unit_mult = position_size(score, entry, units)
+    if qty <= 0 or notional <= 0:
+        return False, f"{ticker}: לפי יוניטים, ניקוד {score} לא מקבל כניסה."
+
+    ok, eg, ec, en, msg = cost_tradeoff(side, entry, target, qty, costs)
+    if not ok:
+        return False, f"{ticker}: {msg} ברוטו ${eg:.2f}, עלות ${ec:.2f}, נטו ${en:.2f}."
+
+    entry_cost, exit_cost, total_cost_now = estimate_costs(entry, entry, qty, costs)
+
+    row = {
+        "trade_id": str(uuid.uuid4()),
+        "status": "OPEN",
+        "ticker": ticker,
+        "mode": mode,
+        "side": side,
+        "score": score,
+        "entry_time": now_ny_iso(),
+        "exit_time": "",
+        "age_minutes": 0.0,
+        "entry_price": entry,
+        "current_price": entry,
+        "exit_price": np.nan,
+        "quantity": qty,
+        "notional": notional,
+        "stop_loss": stop,
+        "initial_stop_loss": stop,
+        "profit_stop": np.nan,
+        "target_reference": target,
+        "highest_price": entry,
+        "lowest_price": entry,
+        "entry_cost": entry_cost,
+        "exit_cost": exit_cost,
+        "total_cost": total_cost_now,
+        "gross_pnl": 0.0,
+        "net_pnl": -total_cost_now,
+        "net_pnl_pct": (-total_cost_now / notional) * 100 if notional else 0,
+        "exit_reason": "",
+        "management_action": "OPENED",
+        "management_reason": "נפתחה עסקה אחרי בדיקת ניקוד, עלויות ויוניטים.",
+        "signal_reason": signal.get("reason", ""),
+        "cost_pct_per_side": costs["cost_pct_per_side"],
+        "fixed_fee_per_side": costs["fixed_fee_per_side"],
+        "min_fee_per_side": costs["min_fee_per_side"],
+        "max_cost_to_target_pct": costs["max_cost_to_target_pct"],
+        "base_unit_dollars": units["base_unit_dollars"],
+        "unit_multiplier": unit_mult,
+        "created_settings_snapshot": json.dumps({"costs": costs, "units": units, "rules": rules}, ensure_ascii=False),
+    }
+
+    trades = pd.concat([trades, pd.DataFrame([row])], ignore_index=True)
+    save_trades(trades)
+
+    return True, f"{ticker}: נפתחה {side} | {mode} | ניקוד {score} | יוניטים {unit_mult} | נטו צפוי ליעד ${en:.2f}."
+
+def manage_trade(row, df_after_entry):
+    rules = load_rules()
+    side = str(row["side"])
+    mode = str(row["mode"])
+    score = int(safe_float(row["score"], 1))
+    entry = safe_float(row["entry_price"])
+    stop = safe_float(row["stop_loss"])
+    initial_stop = safe_float(row["initial_stop_loss"], stop)
+    target = safe_float(row["target_reference"])
+    age = trade_age_minutes(row)
+    min_hold = min_hold_for_mode(mode, rules)
+
+    res = {
+        "exit": False,
+        "exit_reason": "",
+        "stop_loss": stop,
+        "profit_stop": safe_float(row.get("profit_stop"), np.nan),
+        "target_reference": target,
+        "highest_price": safe_float(row.get("highest_price"), entry),
+        "lowest_price": safe_float(row.get("lowest_price"), entry),
+        "action": "HOLD",
+        "reason": "מחזיק, אין שינוי.",
+    }
+
+    if df_after_entry is None or df_after_entry.empty:
+        return res
+
+    d = add_indicators(df_after_entry).dropna(subset=["close"])
+    if d.empty:
+        return res
+
+    last = d.iloc[-1]
+    current = safe_float(last["close"])
+    high_since = max(res["highest_price"], safe_float(d["high"].max(), current))
+    low_since = min(res["lowest_price"], safe_float(d["low"].min(), current))
+    res["highest_price"] = high_since
+    res["lowest_price"] = low_since
+
+    base_risk = abs(entry - initial_stop)
+    if base_risk <= 0:
+        base_risk = max(entry * 0.001, abs(entry - stop))
+
+    last3 = d.tail(min(3, len(d)))
+    green = int((last3["close"] > last3["open"]).sum())
+    red = int((last3["close"] < last3["open"]).sum())
+
+    ema5 = safe_float(last["ema5"], current)
+    ema5_slope = safe_float(last["ema5_slope"], 0)
+    ema5_curv = safe_float(last["ema5_curv"], 0)
+    macd_slope = safe_float(last["macd_hist_slope"], 0)
+
+    # Higher score gets more room to run. Lower score is managed tighter.
+    if score >= 7:
+        trail_r = 0.95
+    elif score >= 6:
+        trail_r = 0.75
+    elif score >= 5:
+        trail_r = 0.55
+    else:
+        trail_r = 0.38
+
+    actions, reasons = [], []
+
+    # Hard stop is allowed immediately. Everything else waits at least min hold.
+    if side == "LONG":
+        r_now = (current - entry) / base_risk
+        best_r = (high_since - entry) / base_risk
+
+        if current <= stop:
+            res["exit"] = True
+            res["exit_reason"] = "STOP_LOSS"
+            actions.append("EXIT_STOP")
+            reasons.append("הגיע לסטופ.")
+
+        if age >= min_hold:
+            if best_r >= float(rules["min_profit_r_for_profit_stop"]):
+                new_profit_stop = max(entry + 0.05 * base_risk, high_since - trail_r * base_risk)
+                if not np.isfinite(res["profit_stop"]) or new_profit_stop > res["profit_stop"]:
+                    res["profit_stop"] = new_profit_stop
+                    actions.append("RAISE_PROFIT_STOP")
+                    reasons.append("העסקה ברווח, סטופ רווח עלה.")
+
+            if score >= 6 and r_now >= 0.85 and current > ema5 and ema5_slope > 0:
+                new_target = max(target, current + 1.25 * base_risk)
+                if new_target > target:
+                    res["target_reference"] = new_target
+                    actions.append("EXTEND_TARGET")
+                    reasons.append("ניקוד גבוה ומומנטום חיובי — נותנים לעסקה לרוץ.")
+
+            if score < 6 and current >= target:
+                res["exit"] = True
+                res["exit_reason"] = "TARGET_REACHED"
+                actions.append("EXIT_TARGET")
+                reasons.append("ניקוד לא גבוה, יציאה ביעד.")
+
+            if np.isfinite(res["profit_stop"]) and current <= res["profit_stop"]:
+                res["exit"] = True
+                res["exit_reason"] = "PROFIT_STOP"
+                actions.append("EXIT_PROFIT_STOP")
+                reasons.append("חזרה לסטופ רווח.")
+
+            if best_r >= 0.7 and (red >= 2 or ema5_curv < 0 or macd_slope < 0):
+                tightened = current - 0.28 * base_risk
+                if not np.isfinite(res["profit_stop"]) or tightened > res["profit_stop"]:
+                    res["profit_stop"] = tightened
+                    actions.append("TIGHTEN_PROFIT_STOP")
+                    reasons.append("אחרי רווח יש היחלשות, סטופ רווח הודק.")
+
+        # Emergency exit only after a short minimum, to avoid instant entry/exit.
+        if age >= float(rules["emergency_exit_after_minutes"]) and r_now < -0.30 and red >= 2 and current < ema5 and ema5_slope < 0:
+            res["exit"] = True
+            res["exit_reason"] = "EARLY_EXIT_AGAINST_LONG"
+            actions.append("EARLY_EXIT")
+            reasons.append("העסקה הולכת חזק נגד לונג, יציאה מוקדמת.")
+
+    else:
+        r_now = (entry - current) / base_risk
+        best_r = (entry - low_since) / base_risk
+
+        if current >= stop:
+            res["exit"] = True
+            res["exit_reason"] = "STOP_LOSS"
+            actions.append("EXIT_STOP")
+            reasons.append("הגיע לסטופ.")
+
+        if age >= min_hold:
+            if best_r >= float(rules["min_profit_r_for_profit_stop"]):
+                new_profit_stop = min(entry - 0.05 * base_risk, low_since + trail_r * base_risk)
+                if not np.isfinite(res["profit_stop"]) or new_profit_stop < res["profit_stop"]:
+                    res["profit_stop"] = new_profit_stop
+                    actions.append("LOWER_PROFIT_STOP")
+                    reasons.append("העסקה ברווח, סטופ רווח ירד.")
+
+            if score >= 6 and r_now >= 0.85 and current < ema5 and ema5_slope < 0:
+                new_target = min(target, current - 1.25 * base_risk)
+                if new_target < target:
+                    res["target_reference"] = new_target
+                    actions.append("EXTEND_TARGET")
+                    reasons.append("ניקוד גבוה ומומנטום שלילי — נותנים לשורט לרוץ.")
+
+            if score < 6 and current <= target:
+                res["exit"] = True
+                res["exit_reason"] = "TARGET_REACHED"
+                actions.append("EXIT_TARGET")
+                reasons.append("ניקוד לא גבוה, יציאה ביעד.")
+
+            if np.isfinite(res["profit_stop"]) and current >= res["profit_stop"]:
+                res["exit"] = True
+                res["exit_reason"] = "PROFIT_STOP"
+                actions.append("EXIT_PROFIT_STOP")
+                reasons.append("חזרה לסטופ רווח.")
+
+            if best_r >= 0.7 and (green >= 2 or ema5_curv > 0 or macd_slope > 0):
+                tightened = current + 0.28 * base_risk
+                if not np.isfinite(res["profit_stop"]) or tightened < res["profit_stop"]:
+                    res["profit_stop"] = tightened
+                    actions.append("TIGHTEN_PROFIT_STOP")
+                    reasons.append("אחרי רווח יש היחלשות, סטופ רווח הודק.")
+
+        if age >= float(rules["emergency_exit_after_minutes"]) and r_now < -0.30 and green >= 2 and current > ema5 and ema5_slope > 0:
+            res["exit"] = True
+            res["exit_reason"] = "EARLY_EXIT_AGAINST_SHORT"
+            actions.append("EARLY_EXIT")
+            reasons.append("העסקה הולכת חזק נגד שורט, יציאה מוקדמת.")
+
+    if actions:
+        res["action"] = " + ".join(sorted(set(actions)))
+        res["reason"] = " ".join(reasons)
+
+    return res
+
+def update_open_trades():
+    trades = load_trades()
+    messages = []
+    if trades.empty:
+        return trades, messages
+
+    open_idx = trades.index[trades["status"].eq("OPEN")].tolist()
+    for idx in open_idx:
+        ticker = str(trades.loc[idx, "ticker"])
         try:
-            df = fetch_intraday_yfinance(
-                ticker=now_ticker,
-                days_back=cfg.days_back,
-                interval_minutes=cfg.bar_minutes,
-            )
+            df = latest_session(fetch_1m(ticker))
+            if df.empty:
+                continue
 
-            latest_day_df = get_latest_trading_day(df)
-
-            if latest_day_df.empty:
-                st.warning("אין נתונים זמינים ליום המסחר האחרון.")
+            current = safe_float(df.iloc[-1]["close"])
+            entry_time = pd.Timestamp(trades.loc[idx, "entry_time"])
+            if entry_time.tzinfo is None:
+                entry_time = entry_time.tz_localize(NY_TZ)
             else:
-                plan_now = build_invest_now_plan(latest_day_df, cfg)
+                entry_time = entry_time.tz_convert(NY_TZ)
 
-                try:
-                    micro_df = fetch_intraday_yfinance(
-                        ticker=now_ticker,
-                        days_back=min(int(cfg.days_back), 7),
-                        interval_minutes=1,
-                    )
-                    micro_latest_day_df = get_latest_trading_day(micro_df)
-                    micro_plan = build_micro_scalp_plan(micro_latest_day_df)
-                except Exception as micro_error:
-                    micro_plan = {
-                        "bias": "NO_TRADE",
-                        "title_he": "סקאלפ קצר: לא זמין כרגע",
-                        "direction_he": "להמתין",
-                        "confidence_he": "נמוכה",
-                        "setup_score": 0,
-                        "setup_quality": "N/A",
-                        "entry_zone": "לא זמין",
-                        "trigger": "לא זמין",
-                        "stop": "לא זמין",
-                        "target_1": "לא זמין",
-                        "target_2": "לא זמין",
-                        "time_plan": "לא זמין",
-                        "reason": str(micro_error)[:180],
-                        "filters_summary": "",
-                        "risk_reward": "לא זמין",
-                    }
+            after_entry = df[df.index >= entry_time]
+            if after_entry.empty:
+                after_entry = df.tail(5)
 
-                st.markdown("### אינדיקציה לפי טווח זמן")
+            decision = manage_trade(trades.loc[idx], after_entry)
 
-                h_col_1, h_col_2 = st.columns(2)
+            trades.loc[idx, "age_minutes"] = trade_age_minutes(trades.loc[idx])
+            trades.loc[idx, "current_price"] = current
+            trades.loc[idx, "stop_loss"] = decision["stop_loss"]
+            trades.loc[idx, "profit_stop"] = decision["profit_stop"]
+            trades.loc[idx, "target_reference"] = decision["target_reference"]
+            trades.loc[idx, "highest_price"] = decision["highest_price"]
+            trades.loc[idx, "lowest_price"] = decision["lowest_price"]
+            trades.loc[idx, "management_action"] = decision["action"]
+            trades.loc[idx, "management_reason"] = decision["reason"]
 
-                with h_col_1:
-                    st.markdown(
-                        f"""
-<div class="card">
-<h3>⚡ טווח קצר מאוד — 1 עד 5 דקות</h3>
-<p><strong>כיוון:</strong> {micro_plan['direction_he']}</p>
-<p><strong>ביטחון:</strong> {micro_plan['confidence_he']}</p>
-<p><strong>ציון:</strong> {micro_plan['setup_score']} — {micro_plan['setup_quality']}</p>
-<p><strong>אזור כניסה:</strong> {micro_plan['entry_zone']}</p>
-<p><strong>טריגר:</strong> {micro_plan['trigger']}</p>
-<p><strong>סטופ:</strong> {micro_plan['stop']}</p>
-<p><strong>יעדים:</strong> {micro_plan['target_1']} | {micro_plan['target_2']}</p>
-<p><strong>לכמה זמן:</strong> {micro_plan['time_plan']}</p>
-<p><strong>למה:</strong> {micro_plan['reason']}</p>
-<p class="small-muted">זה מיועד לסקאלפ קצר בלבד. אם אין טריגר בנר דקה — אין כניסה.</p>
-</div>
-""",
-                        unsafe_allow_html=True,
-                    )
+            pnl = pnl_for_trade(trades.loc[idx], current)
+            for k, v in pnl.items():
+                trades.loc[idx, k] = v
 
-                with h_col_2:
-                    st.markdown(
-                        f"""
-<div class="card">
-<h3>🕒 טווח בינוני — 30 עד 60 דקות</h3>
-<p><strong>כיוון:</strong> {plan_now['direction_he']}</p>
-<p><strong>ביטחון:</strong> {plan_now['confidence_he']}</p>
-<p><strong>ציון:</strong> {plan_now['setup_score']} — {plan_now['setup_quality']}</p>
-<p><strong>אזור כניסה:</strong> {plan_now['entry_zone']}</p>
-<p><strong>טריגר:</strong> {plan_now['trigger']}</p>
-<p><strong>סטופ:</strong> {plan_now['stop']}</p>
-<p><strong>יעדים:</strong> {plan_now['target_1']} | {plan_now['target_2']}</p>
-<p><strong>לכמה זמן:</strong> {plan_now['time_plan']}</p>
-<p><strong>למה:</strong> {plan_now['reason']}</p>
-<p class="small-muted">יכול להיות שאין עסקה בטווח 30-60 דקות אבל יש סקאלפ קצר, או להפך.</p>
-</div>
-""",
-                        unsafe_allow_html=True,
-                    )
-
-                if plan_now["bias"] == "LONG_WATCH":
-                    st.success(plan_now["title_he"])
-                elif plan_now["bias"] == "SHORT_WATCH":
-                    st.error(plan_now["title_he"])
-                else:
-                    st.warning(plan_now["title_he"])
-
-                n1, n2, n3, n4 = st.columns(4)
-                with n1:
-                    st.metric("מחיר נוכחי", f"{plan_now['current_price']:.2f}" if pd.notna(plan_now["current_price"]) else "N/A")
-                with n2:
-                    st.metric("שינוי מהפתיחה", f"{plan_now['current_move_pct']:.2f}%" if pd.notna(plan_now["current_move_pct"]) else "N/A")
-                with n3:
-                    st.metric("כיוון", plan_now["direction_he"])
-                with n4:
-                    st.metric("ביטחון", plan_now["confidence_he"])
-
-                n5, n6, n7, n8 = st.columns(4)
-                with n5:
-                    st.metric("EMA20", f"{plan_now['ema20']:.2f}" if pd.notna(plan_now["ema20"]) else "N/A")
-                with n6:
-                    st.metric("EMA50", f"{plan_now['ema50']:.2f}" if pd.notna(plan_now["ema50"]) else "N/A")
-                with n7:
-                    st.metric("VWAP", f"{plan_now['vwap']:.2f}" if pd.notna(plan_now["vwap"]) else "N/A")
-                with n8:
-                    st.metric("ציון איכות", f"{plan_now['setup_score']} / איכות: {plan_now['setup_quality']}")
-
-                n9, n10, n11, n12 = st.columns(4)
-                with n9:
-                    st.metric("RSI14", f"{plan_now['rsi14']:.1f}" if pd.notna(plan_now["rsi14"]) else "N/A")
-                with n10:
-                    st.metric("MACD Hist", f"{plan_now['macd_hist']:.4f}" if pd.notna(plan_now["macd_hist"]) else "N/A")
-                with n11:
-                    st.metric("Relative Volume", f"{plan_now['relative_volume']:.2f}x" if pd.notna(plan_now["relative_volume"]) else "N/A")
-                with n12:
-                    st.metric("מרחק מ־VWAP", f"{plan_now['distance_from_vwap_pct']:.2f}%" if pd.notna(plan_now["distance_from_vwap_pct"]) else "N/A")
-
-                st.markdown(
-                    f"""
-<div class="card">
-<h3>תרחיש לימודי לפי הרגע הנוכחי</h3>
-<p><strong>מצב מגמה:</strong> {plan_now['trend_state']}</p>
-<p><strong>אזור כניסה:</strong> {plan_now['entry_zone']}</p>
-<p><strong>טריגר כניסה:</strong> {plan_now['trigger']}</p>
-<p><strong>סטופ:</strong> {plan_now['stop']}</p>
-<p><strong>יעד ראשון:</strong> {plan_now['target_1']}</p>
-<p><strong>יעד שני:</strong> {plan_now['target_2']}</p>
-<p><strong>יחס סיכון־סיכוי:</strong> {plan_now['risk_reward']}</p>
-<p><strong>ציון איכות:</strong> {plan_now['setup_score']} — {plan_now['setup_quality']}</p>
-<p><strong>פילטרים:</strong> {plan_now['filters_summary']}</p>
-<p><strong>לכמה זמן:</strong> {plan_now['time_plan']}</p>
-<p><strong>למה:</strong> {plan_now['reason']}</p>
-<p class="small-muted">
-זה תרחיש לימודי בלבד. אם אין טריגר — אין עסקה. לא לרדוף אחרי מחיר.
-</p>
-</div>
-""",
-                    unsafe_allow_html=True,
-                )
-
-                st.markdown("### גרף עם EMA20 / EMA50 / VWAP")
-                fig_now = plot_candles_with_indicators(latest_day_df, title=f"{now_ticker} — השקעה כעת")
-                if fig_now:
-                    st.plotly_chart(fig_now, use_container_width=True)
-
-                st.markdown("### נתונים גולמיים של התרחיש")
-                st.markdown("#### טווח בינוני 30-60 דקות")
-                st.dataframe(pd.DataFrame([plan_now]), use_container_width=True, hide_index=True)
-                st.markdown("#### טווח קצר מאוד 1-5 דקות")
-                st.dataframe(pd.DataFrame([micro_plan]), use_container_width=True, hide_index=True)
+            if decision["exit"]:
+                trades.loc[idx, "status"] = "CLOSED"
+                trades.loc[idx, "exit_time"] = now_ny_iso()
+                trades.loc[idx, "exit_price"] = current
+                trades.loc[idx, "exit_reason"] = decision["exit_reason"]
+                messages.append(f"{ticker}: נסגרה עסקה — {decision['exit_reason']} | נטו ${pnl['net_pnl']:.2f}")
 
         except Exception as e:
-            st.error(f"שגיאה: {e}")
+            trades.loc[idx, "management_action"] = "ERROR"
+            trades.loc[idx, "management_reason"] = str(e)[:180]
 
-        if now_auto_refresh:
-            time.sleep(20)
-            st.rerun()
+    save_trades(trades)
+    return trades, messages
 
+def close_trade_manually(trade_id):
+    trades = load_trades()
+    mask = trades["trade_id"].astype(str).eq(str(trade_id)) & trades["status"].eq("OPEN")
+    if trades.empty or not mask.any():
+        return False, "העסקה לא נמצאה או כבר סגורה."
+
+    idx = trades.index[mask][0]
+    ticker = str(trades.loc[idx, "ticker"])
+
+    try:
+        df = latest_session(fetch_1m(ticker))
+        current = safe_float(df.iloc[-1]["close"]) if not df.empty else safe_float(trades.loc[idx, "current_price"])
+    except Exception:
+        current = safe_float(trades.loc[idx, "current_price"])
+
+    pnl = pnl_for_trade(trades.loc[idx], current)
+    for k, v in pnl.items():
+        trades.loc[idx, k] = v
+
+    trades.loc[idx, "current_price"] = current
+    trades.loc[idx, "exit_price"] = current
+    trades.loc[idx, "status"] = "CLOSED"
+    trades.loc[idx, "exit_time"] = now_ny_iso()
+    trades.loc[idx, "exit_reason"] = "MANUAL_CLOSE"
+    trades.loc[idx, "management_action"] = "MANUAL_CLOSE"
+    trades.loc[idx, "management_reason"] = "נסגר ידנית על ידי המשתמש."
+
+    save_trades(trades)
+    return True, f"{ticker}: נסגר ידנית במחיר {current:.2f}. נטו ${pnl['net_pnl']:.2f}"
+
+def scan_and_open(tickers, modes, min_score):
+    messages = []
+    opened = 0
+    max_new = int(load_rules()["max_new_trades_per_scan"])
+
+    for ticker in tickers:
+        for mode in modes:
+            if opened >= max_new:
+                messages.append(f"הגעת למקסימום עסקאות חדשות בסריקה: {max_new}.")
+                return messages
+
+            try:
+                sig = make_signal(ticker, mode)
+                ok, msg = open_trade(sig, min_score)
+                if ok:
+                    opened += 1
+                    messages.append(msg)
+                elif "לא משתלם" in msg or "Cooldown" in msg:
+                    messages.append(msg)
+            except Exception as e:
+                messages.append(f"{ticker} | {mode}: שגיאה {str(e)[:100]}")
+            time.sleep(0.05)
+
+    return messages
 
 
 # ============================================================
-# Paper Trading tab
+# Summary + display
 # ============================================================
+
+def fmt_price(x):
+    return "" if pd.isna(x) else f"{safe_float(x):.2f}"
+
+def fmt_money(x):
+    return f"${safe_float(x, 0):,.2f}"
+
+def summary_stats(trades):
+    if trades.empty:
+        return {
+            "opened_count": 0, "open_count": 0, "closed_count": 0,
+            "gross_total": 0.0, "entry_cost_total": 0.0,
+            "cost_total": 0.0, "net_total": 0.0,
+        }
+
+    for col in ["gross_pnl", "entry_cost", "total_cost", "net_pnl"]:
+        trades[col] = pd.to_numeric(trades[col], errors="coerce").fillna(0)
+
+    return {
+        "opened_count": int(len(trades)),
+        "open_count": int(trades["status"].eq("OPEN").sum()),
+        "closed_count": int(trades["status"].eq("CLOSED").sum()),
+        "gross_total": float(trades["gross_pnl"].sum()),
+        "entry_cost_total": float(trades["entry_cost"].sum()),
+        "cost_total": float(trades["total_cost"].sum()),
+        "net_total": float(trades["net_pnl"].sum()),
+    }
+
+def render_summary(trades):
+    stats = summary_stats(trades)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("רווח כולל נטו", fmt_money(stats["net_total"]))
+    c2.metric("רווח מהעסקאות ברוטו", fmt_money(stats["gross_total"]))
+    c3.metric("עלות כניסה כוללת", fmt_money(stats["entry_cost_total"]))
+    c4.metric("סך כל העלויות", fmt_money(stats["cost_total"]))
+
+    d1, d2, d3 = st.columns(3)
+    d1.metric("כמות עסקאות שנפתחו", stats["opened_count"])
+    d2.metric("עסקאות כעת", stats["open_count"])
+    d3.metric("עסקאות סגורות", stats["closed_count"])
+
+def render_open_trades(open_trades):
+    st.markdown("### עסקאות כעת")
+
+    if open_trades.empty:
+        st.info("אין עסקאות פתוחות כרגע.")
+        return
+
+    head = st.columns([0.65, .8, .9, .7, .85, .85, .85, .85, .9, .95, .75, .7])
+    labels = ["סיים", "מניה", "סוג", "כיוון", "כניסה", "נוכחי", "סטופ", "סטופ רווח", "רווח/הפסד", "זמן כניסה", "גיל דק׳", "ניקוד"]
+    for col, label in zip(head, labels):
+        col.markdown(f"**{label}**")
+
+    for _, r in open_trades.iterrows():
+        pnl = safe_float(r["net_pnl"], 0)
+        klass = "green-row" if pnl >= 0 else "red-row"
+
+        st.markdown(f"<div class='{klass}'>", unsafe_allow_html=True)
+        row = st.columns([0.65, .8, .9, .7, .85, .85, .85, .85, .9, .95, .75, .7])
+
+        if row[0].button("סיים", key=f"close_{r['trade_id']}"):
+            ok, msg = close_trade_manually(str(r["trade_id"]))
+            if ok:
+                st.success(msg)
+                st.rerun()
+            else:
+                st.error(msg)
+
+        row[1].write(str(r["ticker"]))
+        row[2].write(str(r["mode"]))
+        row[3].write(str(r["side"]))
+        row[4].write(fmt_price(r["entry_price"]))
+        row[5].write(fmt_price(r["current_price"]))
+        row[6].write(fmt_price(r["stop_loss"]))
+        row[7].write(fmt_price(r["profit_stop"]))
+        row[8].write(fmt_money(pnl))
+        row[9].write(str(r["entry_time"])[:19])
+        row[10].write(f"{safe_float(r['age_minutes'], 0):.1f}")
+        row[11].write(int(safe_float(r["score"], 0)))
+
+        with st.expander(f"ניהול: {r['ticker']} | {r['mode']} | {str(r['trade_id'])[:8]}"):
+            st.write("פעולה אחרונה:", r.get("management_action", ""))
+            st.write("סיבה:", r.get("management_reason", ""))
+            st.write("למה נכנס:", r.get("signal_reason", ""))
+            st.write("עלות כוללת:", fmt_money(r.get("total_cost", 0)))
+        st.markdown("</div>", unsafe_allow_html=True)
+
+def render_closed_trades(closed_trades):
+    st.markdown("### עסקאות שהסתיימו")
+
+    if closed_trades.empty:
+        st.info("אין עסקאות סגורות עדיין.")
+        return
+
+    d = closed_trades.sort_values("exit_time", ascending=False).copy().reset_index(drop=True)
+
+    display = pd.DataFrame({
+        "מניה": d["ticker"],
+        "סוג": d["mode"],
+        "כיוון": d["side"],
+        "מחיר כניסה": d["entry_price"].map(fmt_price),
+        "מחיר יציאה": d["exit_price"].map(fmt_price),
+        "סטופ": d["stop_loss"].map(fmt_price),
+        "סטופ רווח": d["profit_stop"].map(fmt_price),
+        "רווח/הפסד": d["net_pnl"].map(fmt_money),
+        "זמן כניסה": d["entry_time"].astype(str).str.slice(0, 19),
+        "זמן יציאה": d["exit_time"].astype(str).str.slice(0, 19),
+        "ניקוד": d["score"].fillna(0).astype(int),
+        "סיבה": d["exit_reason"],
+    })
+
+    pnl_values = d["net_pnl"].fillna(0).astype(float).tolist()
+
+    def style_row(row):
+        pnl = pnl_values[row.name]
+        if pnl >= 0:
+            return ["background-color:#dcfce7;color:#064e3b;"] * len(row)
+        return ["background-color:#fee2e2;color:#7f1d1d;"] * len(row)
+
+    st.dataframe(display.style.apply(style_row, axis=1), use_container_width=True, hide_index=True)
+
+
+# ============================================================
+# Main UI
+# ============================================================
+
+st.markdown(
+    """
+<div class="title-box">
+<h1>🧪 Paper Trading Lab V2</h1>
+<p>אפליקציית Paper Trading נקייה: עסקאות מהירות/חצי שעה, עלויות, יוניטים לפי ניקוד, וסיכום רווח נטו.</p>
+</div>
+""",
+    unsafe_allow_html=True,
+)
+
+tab_paper, tab_costs, tab_units, tab_rules, tab_help = st.tabs([
+    "🧪 Paper Trading",
+    "💸 עלויות",
+    "📦 יוניטים לפי ניקוד",
+    "⚙️ חוקים חכמים",
+    "📘 הסבר",
+])
+
 
 with tab_paper:
-    st.subheader("🧪 Paper Trading אוטומטי — כולל עלויות קנייה/מכירה")
+    st.markdown("<div class='card warn'><strong>בדמו בלבד:</strong> אין חיבור לברוקר ואין כסף אמיתי.</div>", unsafe_allow_html=True)
 
-    st.markdown(
-        """
-<div class="warning-card">
-<strong>חשוב:</strong>
-זה לא שולח פקודות אמיתיות ולא מתחבר לברוקר. זה רק סימולציה על הנייר.
-כעת הסימולציה כוללת גם עלות קנייה, עלות מכירה, רווח ברוטו, סך עלויות ורווח נטו אחרי עלויות.
-</div>
-""",
-        unsafe_allow_html=True,
-    )
+    trades, update_msgs = update_open_trades()
+    trades = load_trades()
 
-    p_col1, p_col2 = st.columns([1, 2])
+    render_summary(trades)
 
-    with p_col1:
-        paper_mode = st.selectbox(
-            "איזה טווח לסחור על הנייר?",
-            options=["טווח קצר 1-5 דקות", "טווח בינוני 30-60 דקות", "שניהם"],
-            index=2,
-        )
+    st.markdown("---")
 
-        paper_risk = st.number_input(
-            "סיכון דמיוני לעסקה ($)",
-            min_value=1.0,
-            max_value=1000.0,
-            value=25.0,
-            step=5.0,
-        )
+    a, b, c, d = st.columns([1.4, 1.2, 1.1, 1.1])
 
-        paper_max_notional = st.number_input(
-            "מקסימום שווי עסקה דמיוני ($)",
-            min_value=50.0,
-            max_value=100000.0,
-            value=1000.0,
-            step=50.0,
-        )
+    with a:
+        tickers = load_tickers()
+        selected_tickers = st.multiselect("מניות לסריקה", tickers, default=tickers[:min(8, len(tickers))])
+        new_ticker = st.text_input("הוסף מניה", placeholder="לדוגמה: QQQ / NVDA / PLTR")
+        if st.button("➕ הוסף מניה", use_container_width=True):
+            t = normalize_ticker(new_ticker)
+            if t:
+                tickers.append(t)
+                save_tickers(tickers)
+                st.success(f"{t} נוסף.")
+                st.rerun()
 
-        st.markdown("#### מודל עלויות")
+    with b:
+        modes = st.multiselect("סוג השקעה", ["מהירה", "חצי שעה"], default=["מהירה", "חצי שעה"])
+        min_score = st.slider("מינימום ניקוד לפתיחה", 1, 8, 4)
 
-        paper_cost_pct_side = st.number_input(
-            "עלות משתנה לכל צד (%)",
-            min_value=0.0,
-            max_value=2.0,
-            value=0.02,
-            step=0.01,
-            help="0.02% לכל צד = בערך 0.04% קנייה+מכירה. זה כולל הערכת spread/slippage/עמלות.",
-        )
+    with c:
+        run_scan = st.button("▶️ סרוק ופתח עסקאות", use_container_width=True)
+        update_now = st.button("🔄 עדכן עסקאות פתוחות", use_container_width=True)
+        auto_run = st.checkbox("הרצה כל 30 שניות", value=False)
 
-        paper_fixed_fee_side = st.number_input(
-            "עמלה קבועה לכל צד ($)",
-            min_value=0.0,
-            max_value=100.0,
-            value=0.0,
-            step=0.10,
-            help="למשל $1 בקנייה ועוד $1 במכירה.",
-        )
+    with d:
+        clear_all = st.button("🧹 ניקוי עסקאות", use_container_width=True)
+        st.caption("שינוי עלויות/יוניטים/חוקים משפיע רק על העסקאות הבאות, לא על עסקאות פתוחות.")
 
-        paper_min_fee_side = st.number_input(
-            "מינימום עמלה לכל צד ($)",
-            min_value=0.0,
-            max_value=100.0,
-            value=0.0,
-            step=0.10,
-        )
-
-        paper_max_cost_to_target = st.slider(
-            "מקסימום עלות מתוך היעד (%)",
-            min_value=1,
-            max_value=100,
-            value=25,
-            step=1,
-            help="אם העלות קנייה+מכירה גדולה מדי ביחס לרווח הצפוי ליעד — האפליקציה לא תפתח עסקת נייר.",
-        )
-
-        paper_min_score = st.slider(
-            "מינימום ציון לפתיחת עסקת נייר",
-            min_value=1,
-            max_value=8,
-            value=3,
-            step=1,
-        )
-
-        paper_max_open = st.slider(
-            "מקסימום עסקאות פתוחות",
-            min_value=1,
-            max_value=20,
-            value=5,
-            step=1,
-        )
-
-        run_paper_once = st.button("▶️ הרץ Paper Scan עכשיו", use_container_width=True)
-        update_paper_now = st.button("🔄 עדכן עסקאות פתוחות", use_container_width=True)
-        paper_auto = st.checkbox("הפעל Paper Trading אוטומטי כל 30 שניות", value=False)
-
-        clear_paper = st.button("🧹 נקה את כל עסקאות הנייר", use_container_width=True)
-
-    with p_col2:
-        st.markdown(
-            f"""
-<div class="card">
-<h3>איך חישוב העלות עובד?</h3>
-<p><strong>עלות לכל צד:</strong> {paper_cost_pct_side:.3f}% + ${paper_fixed_fee_side:.2f}, מינימום ${paper_min_fee_side:.2f}</p>
-<p><strong>עלות round trip:</strong> קנייה + מכירה.</p>
-<p><strong>טריידאוף:</strong> לפני פתיחת עסקת נייר, האפליקציה בודקת אם הרווח הצפוי ליעד ראשון עדיין חיובי אחרי עלויות.</p>
-<p><strong>סינון:</strong> אם העלות גדולה מ־{paper_max_cost_to_target}% מהרווח הצפוי ליעד — העסקה לא נפתחת.</p>
-<p class="small-muted">
-זה מודל הערכה בלבד. במציאות העלות תלויה בברוקר, ספרד, החלקה, נזילות וסוג פקודה.
-</p>
-</div>
-""",
-            unsafe_allow_html=True,
-        )
-
-    if clear_paper:
-        clear_paper_trades()
-        st.success("כל עסקאות הנייר נמחקו.")
+    if clear_all:
+        clear_trades()
+        st.success("נוקה.")
         st.rerun()
 
-    if update_paper_now:
-        trades = load_paper_trades()
-        trades = update_open_paper_trades(trades)
-        st.success("עסקאות פתוחות עודכנו כולל עלויות.")
+    if update_now:
+        trades, msgs = update_open_trades()
+        for msg in msgs:
+            st.info(msg)
+        st.success("עודכן.")
+        st.rerun()
 
-    if run_paper_once or paper_auto:
-        with st.spinner("מריץ Paper Trading: מעדכן עסקאות, בודק עלויות וסורק איתותים חדשים..."):
-            trades, paper_messages = paper_scan_and_open_trades(
-                ticker_options=get_all_ticker_options(),
-                cfg=cfg,
-                mode=paper_mode,
-                risk_dollars=paper_risk,
-                max_notional=paper_max_notional,
-                min_abs_score=paper_min_score,
-                max_open_trades=paper_max_open,
-                cost_pct_per_side=paper_cost_pct_side,
-                fixed_fee_per_side=paper_fixed_fee_side,
-                min_fee_per_side=paper_min_fee_side,
-                max_cost_to_target_pct=paper_max_cost_to_target,
-            )
-
-        if paper_messages:
-            with st.expander("הודעות הסריקה / עסקאות שנפתחו או דולגו", expanded=True):
-                for msg in paper_messages[:40]:
-                    if "דילוג אחרי עלויות" in msg:
-                        st.warning(msg)
-                    elif "נפתחה עסקת נייר" in msg:
-                        st.success(msg)
-                    else:
-                        st.info(msg)
+    if run_scan or auto_run:
+        if not selected_tickers or not modes:
+            st.warning("בחר מניות וסוג השקעה.")
         else:
-            st.warning("לא נפתחו עסקאות נייר חדשות בסריקה הזו.")
+            with st.spinner("סורק, בודק ניקוד, עלויות ו־cooldown..."):
+                msgs = scan_and_open(selected_tickers, modes, min_score)
+                trades, _ = update_open_trades()
 
-    trades = load_paper_trades()
-    trades = update_open_paper_trades(trades)
-    summary = paper_summary(trades)
+            if msgs:
+                with st.expander("תוצאות סריקה", expanded=True):
+                    for msg in msgs[:80]:
+                        if "נפתחה" in msg:
+                            st.success(msg)
+                        elif "לא משתלם" in msg or "Cooldown" in msg:
+                            st.warning(msg)
+                        else:
+                            st.info(msg)
 
-    s1, s2, s3, s4, s5 = st.columns(5)
-    with s1:
-        st.metric("עסקאות פתוחות", summary["open_trades"])
-    with s2:
-        st.metric("עסקאות סגורות", summary["closed_trades"])
-    with s3:
-        st.metric("רווח ברוטו כולל", f"${summary['total_gross_pnl']:.2f}")
-    with s4:
-        st.metric("סך עלויות", f"${summary['total_costs']:.2f}")
-    with s5:
-        st.metric("רווח נטו אחרי עלויות", f"${summary['total_net_pnl']:.2f}")
+    trades = load_trades()
+    open_trades = trades[trades["status"].eq("OPEN")].copy() if not trades.empty else empty_trades()
+    closed_trades = trades[trades["status"].eq("CLOSED")].copy() if not trades.empty else empty_trades()
 
-    st.metric("Win Rate סגור לפי נטו", f"{summary['win_rate']:.1f}%")
+    render_open_trades(open_trades)
+    render_closed_trades(closed_trades)
 
-    if trades.empty:
-        st.info("עדיין אין עסקאות נייר.")
-    else:
-        st.markdown("### סיכום לפי מניה")
-        by_ticker = paper_cost_summary_by_ticker(trades)
-        if by_ticker.empty:
-            st.info("אין עדיין סיכום לפי מניה.")
-        else:
-            st.dataframe(by_ticker, use_container_width=True, hide_index=True)
-
-        open_trades = trades[trades["status"].eq("OPEN")].copy()
-        closed_trades = trades[trades["status"].eq("CLOSED")].copy()
-
-        st.markdown("### עסקאות פתוחות — כולל עלות ונטו")
-        if open_trades.empty:
-            st.info("אין עסקאות פתוחות כרגע.")
-        else:
-            st.dataframe(
-                open_trades[
-                    [
-                        "opened_at",
-                        "ticker",
-                        "horizon",
-                        "side",
-                        "entry_price",
-                        "stop_price",
-                        "target_1",
-                        "current_price",
-                        "quantity",
-                        "notional",
-                        "commission_per_trade",
-                        "gross_pnl",
-                        "total_trade_cost",
-                        "net_pnl",
-                        "net_pnl_pct",
-                        "expected_net_to_target",
-                        "tradeoff_status",
-                        "signal_score",
-                        "signal_quality",
-                    ]
-                ],
-                use_container_width=True,
-                hide_index=True,
-            )
-
-        st.markdown("### עסקאות סגורות — ברוטו מול נטו")
-        if closed_trades.empty:
-            st.info("עדיין אין עסקאות סגורות.")
-        else:
-            st.dataframe(
-                closed_trades.sort_values("closed_at", ascending=False)[
-                    [
-                        "opened_at",
-                        "closed_at",
-                        "ticker",
-                        "horizon",
-                        "side",
-                        "entry_price",
-                        "stop_price",
-                        "target_1",
-                        "current_price",
-                        "quantity",
-                        "notional",
-                        "commission_per_trade",
-                        "gross_pnl",
-                        "total_trade_cost",
-                        "net_pnl",
-                        "net_pnl_pct",
-                        "exit_reason",
-                        "cost_to_target_ratio_pct",
-                        "signal_score",
-                        "signal_quality",
-                    ]
-                ],
-                use_container_width=True,
-                hide_index=True,
-            )
-
-        st.markdown("### כל העסקאות הגולמיות")
-        with st.expander("פתח טבלה מלאה"):
-            st.dataframe(trades, use_container_width=True, hide_index=True)
-
-    if paper_auto:
+    if auto_run:
         time.sleep(30)
         st.rerun()
 
 
-# ============================================================
-# Help
-# ============================================================
+with tab_costs:
+    st.subheader("💸 עלויות — משפיע רק על עסקאות חדשות")
+    costs = load_costs()
+
+    c1, c2 = st.columns(2)
+    with c1:
+        cost_pct = st.number_input("עלות משתנה לכל צד (%)", 0.0, 3.0, float(costs["cost_pct_per_side"]), 0.01)
+        fixed_fee = st.number_input("עמלה קבועה לכל צד ($)", 0.0, 100.0, float(costs["fixed_fee_per_side"]), 0.10)
+    with c2:
+        min_fee = st.number_input("מינימום עמלה לכל צד ($)", 0.0, 100.0, float(costs["min_fee_per_side"]), 0.10)
+        max_ratio = st.slider("מקסימום עלות מתוך הרווח הצפוי ליעד (%)", 1, 100, int(float(costs["max_cost_to_target_pct"])))
+
+    ex = st.number_input("דוגמה: שווי עסקה ($)", 50.0, 100000.0, 1000.0, 50.0)
+    temp_costs = {
+        "cost_pct_per_side": cost_pct,
+        "fixed_fee_per_side": fixed_fee,
+        "min_fee_per_side": min_fee,
+        "max_cost_to_target_pct": max_ratio,
+    }
+    entry_cost = side_cost(ex, temp_costs)
+    st.info(f"בדוגמה של ${ex:,.0f}: עלות כניסה ≈ ${entry_cost:.2f}, עלות כניסה+יציאה ≈ ${entry_cost*2:.2f}")
+
+    if st.button("💾 שמור עלויות", use_container_width=True):
+        save_costs(temp_costs)
+        st.success("נשמר. ישפיע רק על עסקאות חדשות.")
+
+
+with tab_units:
+    st.subheader("📦 יוניטים לפי ניקוד — משפיע רק על עסקאות חדשות")
+    units = load_units()
+
+    u1, u2 = st.columns(2)
+    with u1:
+        base_unit = st.number_input("ערך יוניט אחד ($)", 10.0, 100000.0, float(units["base_unit_dollars"]), 10.0)
+    with u2:
+        max_trade = st.number_input("מקסימום כסף לעסקה אחת ($)", 10.0, 1000000.0, float(units["max_trade_dollars"]), 50.0)
+
+    score_units = dict(units["score_units"])
+    new_score_units = {}
+    cols = st.columns(4)
+
+    for score in range(1, 9):
+        with cols[(score - 1) % 4]:
+            new_score_units[str(score)] = st.number_input(
+                f"ניקוד {score}",
+                min_value=0.0,
+                max_value=50.0,
+                value=float(score_units.get(str(score), 0.0)),
+                step=0.25,
+                key=f"score_unit_{score}",
+            )
+
+    preview = []
+    for score in range(1, 9):
+        mult = float(new_score_units[str(score)])
+        dollars = min(base_unit * mult, max_trade)
+        preview.append({"ניקוד": score, "יוניטים": mult, "כסף לעסקה": f"${dollars:,.2f}"})
+    st.dataframe(pd.DataFrame(preview), use_container_width=True, hide_index=True)
+
+    if st.button("💾 שמור יוניטים", use_container_width=True):
+        save_units({"base_unit_dollars": base_unit, "max_trade_dollars": max_trade, "score_units": new_score_units})
+        st.success("נשמר. ישפיע רק על עסקאות חדשות.")
+
+
+with tab_rules:
+    st.subheader("⚙️ חוקים חכמים נגד כניסה/יציאה מהירה מדי")
+    rules = load_rules()
+
+    r1, r2 = st.columns(2)
+    with r1:
+        min_hold_fast = st.number_input("מינימום החזקה לעסקה מהירה, בדקות", 0, 60, int(rules["min_hold_fast_minutes"]))
+        min_hold_half = st.number_input("מינימום החזקה לעסקת חצי שעה, בדקות", 0, 120, int(rules["min_hold_half_hour_minutes"]))
+        cooldown = st.number_input("Cooldown אחרי סגירה, בדקות", 0, 120, int(rules["cooldown_after_close_minutes"]))
+    with r2:
+        max_new = st.number_input("מקסימום עסקאות חדשות בכל סריקה", 1, 20, int(rules["max_new_trades_per_scan"]))
+        profit_r = st.number_input("כמה רווח R לפני הפעלת סטופ רווח", 0.1, 3.0, float(rules["min_profit_r_for_profit_stop"]), 0.05)
+        emergency_minutes = st.number_input("מינימום דקות לפני יציאה מוקדמת נגד הכיוון", 0, 30, int(rules["emergency_exit_after_minutes"]))
+
+    st.markdown(
+        """
+<div class="card">
+<strong>מה זה עושה?</strong><br>
+האפליקציה לא תיכנס ותצא סתם מהר: היא ממתינה מינימום זמן לפני יציאה רגילה,
+שומרת cooldown אחרי סגירה, ומגבילה כמה עסקאות חדשות נפתחות בכל סריקה.
+סטופ לוס קשיח עדיין יכול לסגור מיד כדי להגן על ההפסד.
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+    if st.button("💾 שמור חוקים", use_container_width=True):
+        save_rules({
+            "min_hold_fast_minutes": int(min_hold_fast),
+            "min_hold_half_hour_minutes": int(min_hold_half),
+            "cooldown_after_close_minutes": int(cooldown),
+            "max_new_trades_per_scan": int(max_new),
+            "min_profit_r_for_profit_stop": float(profit_r),
+            "emergency_exit_after_minutes": int(emergency_minutes),
+        })
+        st.success("נשמר.")
+
 
 with tab_help:
-    st.subheader("📘 איך להבין את התוצאות?")
-
+    st.subheader("📘 הסבר")
     st.markdown(
         """
-<div class="card">
-<h3>1. מה זה opening_type?</h3>
-<p>זה סוג הפתיחה. לדוגמה:</p>
-<ul>
-<li><strong>sharp_up_clean_up</strong> — עלייה חדה ונקייה</li>
-<li><strong>sharp_up_up_rejected</strong> — עלייה חדה עם דחייה מלמעלה</li>
-<li><strong>moderate_down_clean_down</strong> — ירידה מתונה ונקייה</li>
-<li><strong>flat_open_volatile_chop</strong> — פתיחה שטוחה אבל תנודתית</li>
-</ul>
-</div>
-""",
-        unsafe_allow_html=True,
-    )
+### מה חדש ב־V2?
 
-    st.markdown(
-        """
-<div class="card">
-<h3>2. מה זה after_result?</h3>
-<ul>
-<li><strong>continued_first</strong> — אחרי עלייה בפתיחה, המחיר המשיך קודם למעלה</li>
-<li><strong>half_retrace_first</strong> — אחרי עלייה בפתיחה, המחיר קודם תיקן חצי מהעלייה</li>
-<li><strong>continued_down_first</strong> — אחרי ירידה בפתיחה, המחיר המשיך קודם למטה</li>
-<li><strong>half_rebound_first</strong> — אחרי ירידה בפתיחה, המחיר קודם חזר חצי מהירידה</li>
-<li><strong>range_no_clear_move</strong> — לא היה מהלך ברור</li>
-</ul>
-</div>
-""",
-        unsafe_allow_html=True,
-    )
+**סיכום עליון**
+- רווח כולל נטו = רווח אחרי כל העלויות.
+- רווח מהעסקאות ברוטו = לפני עלויות.
+- עלות כניסה כוללת = כמה עלתה הכניסה לכל העסקאות.
+- סך כל העלויות = כניסה + יציאה משוערת.
+- כמות עסקאות שנפתחו, עסקאות כעת, עסקאות סגורות.
 
-    st.markdown(
-        """
-<div class="warning-card">
-<strong>כלל חשוב:</strong>
-גם אם ההיסטוריה אומרת ש־60% מהמקרים קרה משהו,
-זה לא אומר שזה יקרה היום. זה רק יתרון סטטיסטי אפשרי, לא ודאות.
-</div>
-""",
-        unsafe_allow_html=True,
+**לא נכנס ויוצא מהר**
+- יש מינימום זמן החזקה.
+- יש cooldown אחרי סגירה.
+- יש מקסימום עסקאות חדשות בכל סריקה.
+- יציאה מוקדמת נגד הכיוון קיימת, אבל רק אחרי זמן מינימלי.
+- סטופ לוס קשיח עדיין יכול לסגור מיד כדי לא לתת להפסד לברוח.
+
+**שינוי הגדרות**
+שינוי עלויות, יוניטים או חוקים משפיע רק על עסקאות חדשות.
+עסקה שכבר פתוחה שומרת את ההגדרות שהיו בזמן הפתיחה.
+
+**ניקוד**
+הניקוד 1–8 מבוסס לא רק על “מעל/מתחת”, אלא גם על:
+- שיפוע EMA/VWAP/RSI
+- עקמומיות, כלומר האם השיפוע מתחזק או נחלש
+- מומנטום
+- ווליום
+- מבנה נרות
+"""
     )
