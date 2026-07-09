@@ -15,7 +15,7 @@ import plotly.graph_objects as go
 # App setup
 # ============================================================
 
-st.set_page_config(page_title="Paper Trading Lab V5.2", page_icon="🧪", layout="wide")
+st.set_page_config(page_title="Paper Trading Lab V5.3", page_icon="🧪", layout="wide")
 
 DATA_DIR = Path("paper_data")
 DATA_DIR.mkdir(exist_ok=True)
@@ -294,19 +294,63 @@ def clear_trades():
 
 
 def empty_pending():
-    return pd.DataFrame(columns=PENDING_COLUMNS)
+    df = pd.DataFrame(columns=PENDING_COLUMNS)
+    for col in PENDING_COLUMNS:
+        df[col] = df[col].astype("object")
+    return df
 
 
 def load_pending():
+    """
+    Load pending signals safely.
+
+    Important:
+    On newer pandas versions, assigning a string timestamp into a column that
+    was inferred as float can raise a TypeError. Therefore we explicitly cast
+    text/status/date columns to object/string-friendly dtype.
+    """
     if not PENDING_FILE.exists() or PENDING_FILE.stat().st_size == 0:
         return empty_pending()
+
     try:
         df = pd.read_csv(PENDING_FILE)
+    except pd.errors.EmptyDataError:
+        return empty_pending()
     except Exception:
         return empty_pending()
+
     for col in PENDING_COLUMNS:
         if col not in df.columns:
-            df[col] = np.nan
+            df[col] = ""
+
+    df = df[PENDING_COLUMNS].copy()
+
+    text_cols = [
+        "pending_id",
+        "created_at",
+        "ticker",
+        "mode",
+        "side",
+        "reason",
+        "status",
+        "last_checked_at",
+        "message",
+    ]
+    num_cols = [
+        "score",
+        "entry_price",
+        "stop_loss",
+        "target_reference",
+    ]
+
+    for col in text_cols:
+        if col in df.columns:
+            df[col] = df[col].astype("object").where(pd.notna(df[col]), "")
+
+    for col in num_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
     return df[PENDING_COLUMNS]
 
 
@@ -314,10 +358,29 @@ def save_pending(df):
     if df is None or df.empty:
         empty_pending().to_csv(PENDING_FILE, index=False)
         return
+
     for col in PENDING_COLUMNS:
         if col not in df.columns:
-            df[col] = np.nan
-    df[PENDING_COLUMNS].to_csv(PENDING_FILE, index=False)
+            df[col] = ""
+
+    df = df[PENDING_COLUMNS].copy()
+
+    text_cols = [
+        "pending_id",
+        "created_at",
+        "ticker",
+        "mode",
+        "side",
+        "reason",
+        "status",
+        "last_checked_at",
+        "message",
+    ]
+    for col in text_cols:
+        if col in df.columns:
+            df[col] = df[col].astype("object").where(pd.notna(df[col]), "")
+
+    df.to_csv(PENDING_FILE, index=False)
 
 
 def clear_pending():
@@ -366,6 +429,11 @@ def process_pending_signals(min_score, max_new_override=None, max_open_override=
     messages = []
     if pending.empty:
         return messages
+
+    # Ensure these columns can safely receive strings even if an old CSV inferred float dtype.
+    for _col in ["last_checked_at", "message", "status"]:
+        if _col in pending.columns:
+            pending[_col] = pending[_col].astype("object")
 
     rules = load_rules()
     trades = load_trades()
@@ -1669,7 +1737,7 @@ def render_closed_trades(closed_trades):
 st.markdown(
     """
 <div class="title-box">
-<h1>🧪 Paper Trading Lab V5.2</h1>
+<h1>🧪 Paper Trading Lab V5.3</h1>
 <p>אפליקציית Paper Trading נקייה: יעד מחזור 50$, סטופ ידני, סיבות יציאה, Break-even אחרי עלויות וצמצום הפסדים.</p>
 </div>
 """,

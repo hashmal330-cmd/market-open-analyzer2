@@ -1,3 +1,3 @@
-# Paper Trading Lab V5.2
+# Paper Trading Lab V5.3
 
-Fixes StreamlitDuplicateElementId by adding unique widget keys. Paper trading only. Educational/demo only, not investment advice.
+Fixes pending_signals dtype TypeError on newer pandas/Streamlit Cloud. Paper trading only. Educational/demo only, not investment advice.
