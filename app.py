@@ -15,7 +15,7 @@ import plotly.graph_objects as go
 # App setup
 # ============================================================
 
-st.set_page_config(page_title="Paper Trading Lab V5.3", page_icon="🧪", layout="wide")
+st.set_page_config(page_title="Paper Trading Lab V5.4", page_icon="🧪", layout="wide")
 
 DATA_DIR = Path("paper_data")
 DATA_DIR.mkdir(exist_ok=True)
@@ -265,29 +265,92 @@ def exit_reason_he(reason):
 
 
 def empty_trades():
-    return pd.DataFrame(columns=TRADE_COLUMNS)
+    df = pd.DataFrame(columns=TRADE_COLUMNS)
+    for col in TRADE_COLUMNS:
+        df[col] = df[col].astype("object")
+    return df
+
 
 def load_trades():
+    """
+    Load trades safely.
+
+    On newer pandas versions, assigning text timestamps into columns that were
+    inferred as float can raise a TypeError. Therefore we force text/date
+    columns to object dtype and numeric columns to numeric dtype.
+    """
     if not TRADES_FILE.exists() or TRADES_FILE.stat().st_size == 0:
         return empty_trades()
+
     try:
         df = pd.read_csv(TRADES_FILE)
+    except pd.errors.EmptyDataError:
+        return empty_trades()
     except Exception:
         return empty_trades()
 
     for col in TRADE_COLUMNS:
         if col not in df.columns:
-            df[col] = np.nan
+            df[col] = ""
+
+    df = df[TRADE_COLUMNS].copy()
+
+    text_cols = [
+        "trade_id", "status", "ticker", "mode", "side",
+        "entry_time", "exit_time",
+        "exit_reason", "exit_reason_he",
+        "management_action", "management_reason", "signal_reason",
+        "created_settings_snapshot",
+    ]
+
+    numeric_cols = [
+        "score", "duration_minutes", "age_minutes",
+        "entry_price", "current_price", "exit_price",
+        "quantity", "notional",
+        "stop_loss", "initial_stop_loss", "manual_stop_loss", "profit_stop",
+        "target_reference", "breakeven_price",
+        "highest_price", "lowest_price", "max_net_pnl_seen",
+        "entry_cost", "exit_cost", "total_cost",
+        "gross_pnl", "net_pnl", "net_pnl_pct",
+        "cost_pct_per_side", "fixed_fee_per_side", "min_fee_per_side",
+        "max_cost_to_target_pct",
+        "base_unit_dollars", "unit_multiplier",
+    ]
+
+    for col in text_cols:
+        if col in df.columns:
+            df[col] = df[col].astype("object").where(pd.notna(df[col]), "")
+
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
     return df[TRADE_COLUMNS]
 
 def save_trades(df):
     if df is None or df.empty:
         empty_trades().to_csv(TRADES_FILE, index=False)
         return
+
     for col in TRADE_COLUMNS:
         if col not in df.columns:
-            df[col] = np.nan
-    df[TRADE_COLUMNS].to_csv(TRADES_FILE, index=False)
+            df[col] = ""
+
+    df = df[TRADE_COLUMNS].copy()
+
+    text_cols = [
+        "trade_id", "status", "ticker", "mode", "side",
+        "entry_time", "exit_time",
+        "exit_reason", "exit_reason_he",
+        "management_action", "management_reason", "signal_reason",
+        "created_settings_snapshot",
+    ]
+
+    for col in text_cols:
+        if col in df.columns:
+            df[col] = df[col].astype("object").where(pd.notna(df[col]), "")
+
+    df.to_csv(TRADES_FILE, index=False)
 
 def clear_trades():
     save_trades(empty_trades())
@@ -1368,6 +1431,12 @@ def manage_trade(row, df_after_entry):
 
 
 def close_trade_at_index(trades, idx, current, reason):
+    # Defensive dtype fix: prevents pandas from rejecting timestamp strings
+    # in columns that were inferred as float from old CSV files.
+    for _col in ["exit_time", "exit_reason", "exit_reason_he", "status", "management_action", "management_reason"]:
+        if _col in trades.columns:
+            trades[_col] = trades[_col].astype("object")
+
     pnl = pnl_for_trade(trades.loc[idx], current)
     for k, v in pnl.items():
         trades.loc[idx, k] = v
@@ -1737,7 +1806,7 @@ def render_closed_trades(closed_trades):
 st.markdown(
     """
 <div class="title-box">
-<h1>🧪 Paper Trading Lab V5.3</h1>
+<h1>🧪 Paper Trading Lab V5.4</h1>
 <p>אפליקציית Paper Trading נקייה: יעד מחזור 50$, סטופ ידני, סיבות יציאה, Break-even אחרי עלויות וצמצום הפסדים.</p>
 </div>
 """,
