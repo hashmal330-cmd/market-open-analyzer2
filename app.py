@@ -59,8 +59,8 @@ DEFAULT_RULES = {
     "min_hold_fast_minutes": 3,
     "min_hold_half_hour_minutes": 10,
     "cooldown_after_close_minutes": 8,
-    "max_new_trades_per_scan": 3,
-    "max_open_trades": 6,
+    "max_new_trades_per_scan": 2,
+    "max_open_trades": 4,
 
     # Profit-taking and protection
     "cycle_net_profit_target": 50.0,
@@ -68,7 +68,7 @@ DEFAULT_RULES = {
     "emergency_exit_after_minutes": 2,
     "breakeven_after_profit_dollars": 4.0,
     "lock_profit_after_net_dollars": 8.0,
-    "max_allowed_loss_per_trade_dollars": 20.0,
+    "max_allowed_loss_per_trade_dollars": 7.0,
     "exit_if_profitable_trade_turns_red": True,
     "exit_on_target_when_score_below": 7,
     "profit_giveback_pct": 10.0,
@@ -260,97 +260,36 @@ def exit_reason_he(reason):
         "MANUAL_CLOSE": "סגירה ידנית",
         "CYCLE_TARGET_50": "מחזור רווח הושלם: נסגר בגלל יעד רווח נטו",
         "PROFIT_GIVEBACK": "הרווח ירד באחוז שהוגדר מהרווח המקסימלי",
+        "NO_PROGRESS_FAST": "העסקה לא התקדמה אחרי 2–3 נרות",
+        "NO_PROGRESS_HALF": "העסקה לא התקדמה מספיק בזמן שהוגדר",
     }
     return mapping.get(str(reason), str(reason or ""))
 
 
 def empty_trades():
-    df = pd.DataFrame(columns=TRADE_COLUMNS)
-    for col in TRADE_COLUMNS:
-        df[col] = df[col].astype("object")
-    return df
-
+    return pd.DataFrame(columns=TRADE_COLUMNS)
 
 def load_trades():
-    """
-    Load trades safely.
-
-    On newer pandas versions, assigning text timestamps into columns that were
-    inferred as float can raise a TypeError. Therefore we force text/date
-    columns to object dtype and numeric columns to numeric dtype.
-    """
     if not TRADES_FILE.exists() or TRADES_FILE.stat().st_size == 0:
         return empty_trades()
-
     try:
         df = pd.read_csv(TRADES_FILE)
-    except pd.errors.EmptyDataError:
-        return empty_trades()
     except Exception:
         return empty_trades()
 
     for col in TRADE_COLUMNS:
         if col not in df.columns:
-            df[col] = ""
-
-    df = df[TRADE_COLUMNS].copy()
-
-    text_cols = [
-        "trade_id", "status", "ticker", "mode", "side",
-        "entry_time", "exit_time",
-        "exit_reason", "exit_reason_he",
-        "management_action", "management_reason", "signal_reason",
-        "created_settings_snapshot",
-    ]
-
-    numeric_cols = [
-        "score", "duration_minutes", "age_minutes",
-        "entry_price", "current_price", "exit_price",
-        "quantity", "notional",
-        "stop_loss", "initial_stop_loss", "manual_stop_loss", "profit_stop",
-        "target_reference", "breakeven_price",
-        "highest_price", "lowest_price", "max_net_pnl_seen",
-        "entry_cost", "exit_cost", "total_cost",
-        "gross_pnl", "net_pnl", "net_pnl_pct",
-        "cost_pct_per_side", "fixed_fee_per_side", "min_fee_per_side",
-        "max_cost_to_target_pct",
-        "base_unit_dollars", "unit_multiplier",
-    ]
-
-    for col in text_cols:
-        if col in df.columns:
-            df[col] = df[col].astype("object").where(pd.notna(df[col]), "")
-
-    for col in numeric_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
+            df[col] = np.nan
     return df[TRADE_COLUMNS]
 
 def save_trades(df):
     if df is None or df.empty:
         empty_trades().to_csv(TRADES_FILE, index=False)
         return
-
     for col in TRADE_COLUMNS:
         if col not in df.columns:
-            df[col] = ""
-
-    df = df[TRADE_COLUMNS].copy()
-
-    text_cols = [
-        "trade_id", "status", "ticker", "mode", "side",
-        "entry_time", "exit_time",
-        "exit_reason", "exit_reason_he",
-        "management_action", "management_reason", "signal_reason",
-        "created_settings_snapshot",
-    ]
-
-    for col in text_cols:
-        if col in df.columns:
-            df[col] = df[col].astype("object").where(pd.notna(df[col]), "")
-
-    df.to_csv(TRADES_FILE, index=False)
+            df[col] = np.nan
+    df[TRADE_COLUMNS].to_csv(TRADES_FILE, index=False)
 
 def clear_trades():
     save_trades(empty_trades())
@@ -462,8 +401,8 @@ def add_pending_signal(signal):
     ticker = normalize_ticker(signal["ticker"])
     mode = str(signal["mode"])
     trades = load_trades()
-    if has_open_trade(trades, ticker, mode):
-        return False, f"{ticker}: כבר יש עסקה פתוחה ב־{mode}."
+    if has_any_open_trade_for_ticker(trades, ticker):
+        return False, f"{ticker}: כבר יש עסקה פתוחה על המניה הזו. לא פותחים כפול על אותה מניה."
     if has_pending_signal(ticker, mode):
         return False, f"{ticker}: כבר יש מועמדת בהמתנה לבדיקה."
 
@@ -545,15 +484,18 @@ def process_pending_signals(min_score, max_new_override=None, max_open_override=
 
         new_side = str(new_signal.get("signal", "WAIT"))
         new_score = int(new_signal.get("score", 0))
-        if new_side != original_side:
+
+        confirmed, confirm_msg = signal_confirmed_after_delay(
+            original_side=original_side,
+            original_score=original_score,
+            new_signal=new_signal,
+            min_score=min_score,
+        )
+
+        if not confirmed:
             pending.loc[idx, "status"] = "REJECTED"
-            pending.loc[idx, "message"] = f"נדחה: הכיוון השתנה מ־{original_side} ל־{new_side}."
-            messages.append(f"{ticker}: לא נכנסנו — הכיוון השתנה אחרי דקה.")
-            continue
-        if new_score < int(min_score):
-            pending.loc[idx, "status"] = "REJECTED"
-            pending.loc[idx, "message"] = f"נדחה: הניקוד ירד מ־{original_score} ל־{new_score}."
-            messages.append(f"{ticker}: לא נכנסנו — הניקוד ירד אחרי דקה.")
+            pending.loc[idx, "message"] = f"נדחה אחרי דקה: {confirm_msg}"
+            messages.append(f"{ticker}: לא נכנסנו — {confirm_msg}")
             continue
 
         ok, msg = open_trade(new_signal, min_score=min_score)
@@ -1049,6 +991,62 @@ def has_open_trade(trades, ticker, mode):
         return False
     return bool((trades["status"].eq("OPEN") & trades["ticker"].astype(str).eq(ticker) & trades["mode"].astype(str).eq(mode)).any())
 
+
+def has_any_open_trade_for_ticker(trades, ticker):
+    """
+    Conservative rule:
+    Do not allow two open trades on the same ticker, even if one is 'מהירה'
+    and the other is 'חצי שעה'. This prevents doubled risk on the same stock.
+    """
+    if trades.empty:
+        return False
+    return bool((trades["status"].eq("OPEN") & trades["ticker"].astype(str).eq(str(ticker))).any())
+
+
+def apply_risk_cap_to_position(side, entry, stop, score_qty, score_notional, max_loss_dollars):
+    """
+    Cap position size by real dollar risk to stop.
+    This prevents score 8 from creating a large loss when the stop is far.
+    """
+    risk_per_share = abs(float(entry) - float(stop))
+    if risk_per_share <= 0:
+        return 0.0, 0.0, "מרחק הסטופ לא תקין."
+
+    qty_by_risk = float(max_loss_dollars) / risk_per_share
+    qty = min(float(score_qty), float(qty_by_risk))
+    notional = abs(qty * float(entry))
+
+    if qty <= 0 or notional <= 0:
+        return 0.0, 0.0, "גודל העסקה יצא 0 אחרי הגבלת סיכון."
+
+    risk_dollars = qty * risk_per_share
+    return float(qty), float(notional), f"גודל העסקה הוגבל לפי סיכון לסטופ: הפסד מקסימלי משוער ${risk_dollars:.2f}."
+
+
+def signal_confirmed_after_delay(original_side, original_score, new_signal, min_score):
+    """
+    Stronger confirmation after the 1-minute wait:
+    - same direction
+    - score did not collapse
+    - still at least min_score
+    - score 8 must remain strong enough
+    """
+    new_side = str(new_signal.get("signal", "WAIT"))
+    new_score = int(new_signal.get("score", 0))
+
+    if new_side != str(original_side):
+        return False, f"הכיוון השתנה מ־{original_side} ל־{new_side}."
+
+    required_score = max(int(min_score), int(original_score) - 1)
+    if int(original_score) >= 8:
+        required_score = max(required_score, 7)
+
+    if new_score < required_score:
+        return False, f"הניקוד ירד מ־{original_score} ל־{new_score}; נדרש לפחות {required_score}."
+
+    return True, "האישור החוזר תקין."
+
+
 def in_cooldown(trades, ticker, mode, rules):
     if trades.empty:
         return False, ""
@@ -1094,8 +1092,8 @@ def open_trade(signal, min_score):
         return False, f"{ticker}: אין איתות."
     if score < int(min_score):
         return False, f"{ticker}: ניקוד {score} נמוך מהמינימום."
-    if has_open_trade(trades, ticker, mode):
-        return False, f"{ticker}: כבר יש עסקה פתוחה ב־{mode}."
+    if has_any_open_trade_for_ticker(trades, ticker):
+        return False, f"{ticker}: כבר יש עסקה פתוחה על המניה הזו. לא פותחים כפול על אותה מניה."
 
     cd, msg = in_cooldown(trades, ticker, mode, rules)
     if cd:
@@ -1105,9 +1103,21 @@ def open_trade(signal, min_score):
     stop = float(signal["stop"])
     target = float(signal["target"])
 
-    qty, notional, unit_mult = position_size(score, entry, units)
-    if qty <= 0 or notional <= 0:
+    score_qty, score_notional, unit_mult = position_size(score, entry, units)
+    if score_qty <= 0 or score_notional <= 0:
         return False, f"{ticker}: לפי יוניטים, ניקוד {score} לא מקבל כניסה."
+
+    qty, notional, risk_msg = apply_risk_cap_to_position(
+        side=side,
+        entry=entry,
+        stop=stop,
+        score_qty=score_qty,
+        score_notional=score_notional,
+        max_loss_dollars=float(rules.get("max_allowed_loss_per_trade_dollars", 7.0)),
+    )
+
+    if qty <= 0 or notional <= 0:
+        return False, f"{ticker}: {risk_msg}"
 
     ok, eg, ec, en, msg = cost_tradeoff(side, entry, target, qty, costs)
     if not ok:
@@ -1164,7 +1174,7 @@ def open_trade(signal, min_score):
     trades = pd.concat([trades, pd.DataFrame([row])], ignore_index=True)
     save_trades(trades)
 
-    return True, f"{ticker}: נפתחה {side} | {mode} | ניקוד {score} | יוניטים {unit_mult} | נטו צפוי ליעד ${en:.2f}."
+    return True, f"{ticker}: נפתחה {side} | {mode} | ניקוד {score} | יוניטים {unit_mult} | {risk_msg} | נטו צפוי ליעד ${en:.2f}."
 
 
 def update_trade_stop(trade_id, new_stop):
@@ -1349,6 +1359,18 @@ def manage_trade(row, df_after_entry):
                     actions.append("TIGHTEN_PROFIT_STOP")
                     reasons.append("אחרי רווח יש היחלשות, סטופ רווח הודק כדי לא להחזיר רווח.")
 
+        if str(mode) == "מהירה" and age >= 3 and current_net <= 0 and red >= 2 and current < entry:
+            res["exit"] = True
+            res["exit_reason"] = "NO_PROGRESS_FAST"
+            actions.append("EXIT_NO_PROGRESS")
+            reasons.append("אחרי 2–3 נרות העסקה לא התקדמה לכיוון הלונג.")
+
+        if str(mode) != "מהירה" and age >= 12 and current_net <= 0 and current < ema5 and ema5_slope < 0:
+            res["exit"] = True
+            res["exit_reason"] = "NO_PROGRESS_HALF"
+            actions.append("EXIT_NO_PROGRESS")
+            reasons.append("העסקה לטווח חצי שעה לא התקדמה מספיק והמומנטום נחלש.")
+
         if age >= float(rules["emergency_exit_after_minutes"]) and r_now < -0.25 and red >= 2 and current < ema5 and ema5_slope < 0:
             res["exit"] = True
             res["exit_reason"] = "EARLY_EXIT_AGAINST_LONG"
@@ -1417,6 +1439,18 @@ def manage_trade(row, df_after_entry):
                     actions.append("TIGHTEN_PROFIT_STOP")
                     reasons.append("אחרי רווח יש היחלשות, סטופ רווח הודק כדי לא להחזיר רווח.")
 
+        if str(mode) == "מהירה" and age >= 3 and current_net <= 0 and green >= 2 and current > entry:
+            res["exit"] = True
+            res["exit_reason"] = "NO_PROGRESS_FAST"
+            actions.append("EXIT_NO_PROGRESS")
+            reasons.append("אחרי 2–3 נרות העסקה לא התקדמה לכיוון השורט.")
+
+        if str(mode) != "מהירה" and age >= 12 and current_net <= 0 and current > ema5 and ema5_slope > 0:
+            res["exit"] = True
+            res["exit_reason"] = "NO_PROGRESS_HALF"
+            actions.append("EXIT_NO_PROGRESS")
+            reasons.append("העסקה לטווח חצי שעה לא התקדמה מספיק והמומנטום נחלש.")
+
         if age >= float(rules["emergency_exit_after_minutes"]) and r_now < -0.25 and green >= 2 and current > ema5 and ema5_slope > 0:
             res["exit"] = True
             res["exit_reason"] = "EARLY_EXIT_AGAINST_SHORT"
@@ -1431,12 +1465,6 @@ def manage_trade(row, df_after_entry):
 
 
 def close_trade_at_index(trades, idx, current, reason):
-    # Defensive dtype fix: prevents pandas from rejecting timestamp strings
-    # in columns that were inferred as float from old CSV files.
-    for _col in ["exit_time", "exit_reason", "exit_reason_he", "status", "management_action", "management_reason"]:
-        if _col in trades.columns:
-            trades[_col] = trades[_col].astype("object")
-
     pnl = pnl_for_trade(trades.loc[idx], current)
     for k, v in pnl.items():
         trades.loc[idx, k] = v
@@ -1853,9 +1881,9 @@ with tab_paper:
 
     with b:
         modes = st.multiselect("סוג השקעה", ["מהירה", "חצי שעה"], default=["מהירה", "חצי שעה"])
-        min_score = st.slider("מינימום ניקוד לפתיחה", 1, 8, 4)
-        max_new_now = st.number_input("כמה עסקאות חדשות לפתוח בסריקה", 1, 20, int(load_rules().get("max_new_trades_per_scan", 3)), key="paper_max_new_trades_now")
-        max_open_now = st.number_input("מקסימום עסקאות פתוחות במקביל", 1, 30, int(load_rules().get("max_open_trades", 6)), key="paper_max_open_trades_now")
+        min_score = st.slider("מינימום ניקוד לפתיחה", 1, 8, 8)
+        max_new_now = st.number_input("כמה עסקאות חדשות לפתוח בסריקה", 1, 20, 2, key="paper_max_new_trades_now")
+        max_open_now = st.number_input("מקסימום עסקאות פתוחות במקביל", 1, 30, 4, key="paper_max_open_trades_now")
 
     with c:
         run_scan = st.button("▶️ סרוק ופתח עסקאות", use_container_width=True)
@@ -2116,7 +2144,7 @@ with tab_help:
 - ווליום
 - מבנה נרות
 
-### מה נוסף ב־V5?
+### מה נוסף ב־V5.4?
 
 **זמן יציאה ומשך עסקה**  
 בכל עסקה סגורה מופיע זמן יציאה וגם משך העסקה בדקות.

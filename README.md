@@ -1,3 +1,3 @@
-# Paper Trading Lab V5.3
+# Paper Trading Lab V5.4
 
-Fixes pending_signals dtype TypeError on newer pandas/Streamlit Cloud. Paper trading only. Educational/demo only, not investment advice.
+Conservative risk version: $7 max loss default, one open trade per ticker, risk-based sizing, stronger delayed confirmation, and no-progress exits. Paper trading only. Not investment advice.
