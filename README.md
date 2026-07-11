@@ -1,3 +1,3 @@
-# Paper Trading Lab V5.4
+# Paper Trading Lab V5.7
 
-Conservative risk version: $7 max loss default, one open trade per ticker, risk-based sizing, stronger delayed confirmation, and no-progress exits. Paper trading only. Not investment advice.
+Adds a historical intraday pattern filter after 30 minutes from market open. Paper trading only. Educational/demo only, not investment advice.

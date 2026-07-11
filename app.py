@@ -15,7 +15,7 @@ import plotly.graph_objects as go
 # App setup
 # ============================================================
 
-st.set_page_config(page_title="Paper Trading Lab V5.4", page_icon="🧪", layout="wide")
+st.set_page_config(page_title="Paper Trading Lab V5.7", page_icon="🧪", layout="wide")
 
 DATA_DIR = Path("paper_data")
 DATA_DIR.mkdir(exist_ok=True)
@@ -75,6 +75,10 @@ DEFAULT_RULES = {
     "min_net_profit_for_giveback": 5.0,
     "confirm_before_entry_seconds": 60,
     "pending_signal_expire_minutes": 6,
+    "use_history_after_minutes": 30,
+    "history_min_samples": 2,
+    "history_max_score_bonus": 2,
+    "history_max_score_penalty": 2,
 }
 
 DEFAULT_ACCOUNT = {
@@ -835,6 +839,191 @@ def make_live_trade_chart(ticker: str, row=None):
     return fig
 
 
+
+
+# ============================================================
+# Historical pattern filter
+# ============================================================
+
+def session_minutes_from_open(ts):
+    """
+    Minutes from regular US market open 09:30 NY.
+    """
+    t = timestamp_to_ny(ts)
+    if t is None:
+        return 0.0
+    return (t.hour * 60 + t.minute + t.second / 60.0) - (9 * 60 + 30)
+
+
+def historical_pattern_adjustment(ticker, mode, side, current_session_df, current_time=None):
+    """
+    After the first ~30 minutes, compare the current intraday structure of the stock
+    with previous days.
+
+    This is not a prediction engine. It is a conservative additional filter:
+    - If similar past intraday structures usually continued in the same direction,
+      add score.
+    - If similar structures usually reversed against the trade direction,
+      subtract score.
+    - If there are not enough samples, do nothing.
+
+    Features compared:
+    - return from open
+    - distance from VWAP
+    - intraday range %
+    - recent slope
+    - elapsed minutes from open
+
+    Uses yfinance 1m data, so history is limited to recent days.
+    """
+    rules = load_rules()
+    after_minutes = float(rules.get("use_history_after_minutes", 30))
+    min_samples = int(rules.get("history_min_samples", 2))
+    max_bonus = int(rules.get("history_max_score_bonus", 2))
+    max_penalty = int(rules.get("history_max_score_penalty", 2))
+
+    if current_session_df is None or current_session_df.empty:
+        return {"delta": 0, "reason": "אין נתוני היסטוריה להשוואה."}
+
+    d = add_indicators(current_session_df).dropna(subset=["close"]).copy()
+    if d.empty:
+        return {"delta": 0, "reason": "אין מספיק אינדיקטורים להשוואה היסטורית."}
+
+    if current_time is None:
+        current_time = d.index[-1]
+
+    elapsed = session_minutes_from_open(current_time)
+    if elapsed < after_minutes:
+        return {
+            "delta": 0,
+            "reason": f"היסטוריה לא הופעלה: עברו {elapsed:.0f} דק׳ מהפתיחה, נדרש {after_minutes:.0f}.",
+        }
+
+    # Horizon: what we check after a similar past setup.
+    horizon = 10 if str(mode) == "מהירה" else 30
+
+    current_day = d[d.index.date == timestamp_to_ny(current_time).date()].copy()
+    if len(current_day) < 10:
+        return {"delta": 0, "reason": "אין מספיק נרות ביום הנוכחי להשוואה היסטורית."}
+
+    last = current_day.iloc[-1]
+    open_price = safe_float(current_day.iloc[0]["open"], safe_float(last["close"]))
+    close_now = safe_float(last["close"])
+
+    current_features = {
+        "ret_open": (close_now / open_price - 1) * 100 if open_price else 0,
+        "vwap_gap": (close_now / safe_float(last.get("vwap"), close_now) - 1) * 100 if close_now else 0,
+        "range_pct": ((safe_float(current_day["high"].max()) - safe_float(current_day["low"].min())) / open_price) * 100 if open_price else 0,
+        "slope_pct": (linear_slope_per_bar(current_day["close"], lookback=15) / close_now) * 100 if close_now else 0,
+    }
+
+    try:
+        all_df = fetch_1m(ticker)
+    except Exception:
+        return {"delta": 0, "reason": "לא ניתן למשוך היסטוריה מהמניה."}
+
+    if all_df is None or all_df.empty:
+        return {"delta": 0, "reason": "אין היסטוריה זמינה מהמניה."}
+
+    all_df = add_indicators(all_df).dropna(subset=["close"]).copy()
+    current_date = timestamp_to_ny(current_time).date()
+
+    samples = []
+    for day, day_df in all_df.groupby(all_df.index.date):
+        if day >= current_date:
+            continue
+
+        day_df = day_df.sort_index()
+        if len(day_df) < elapsed + horizon + 5:
+            # rough guard; elapsed is minutes and data is 1m
+            pass
+
+        # Find the candle in that day closest to the same minutes-from-open.
+        day_df = day_df.copy()
+        day_df["_elapsed"] = [session_minutes_from_open(x) for x in day_df.index]
+        past_now = day_df.iloc[(day_df["_elapsed"] - elapsed).abs().argsort()[:1]]
+        if past_now.empty:
+            continue
+
+        past_idx = past_now.index[0]
+        loc = day_df.index.get_loc(past_idx)
+        if isinstance(loc, slice) or isinstance(loc, np.ndarray):
+            continue
+
+        future_loc = loc + int(horizon)
+        if future_loc >= len(day_df):
+            continue
+
+        past_slice = day_df.iloc[: loc + 1]
+        if len(past_slice) < 10:
+            continue
+
+        past_last = day_df.iloc[loc]
+        past_open = safe_float(day_df.iloc[0]["open"], safe_float(past_last["close"]))
+        past_close = safe_float(past_last["close"])
+        future_close = safe_float(day_df.iloc[future_loc]["close"])
+
+        past_features = {
+            "ret_open": (past_close / past_open - 1) * 100 if past_open else 0,
+            "vwap_gap": (past_close / safe_float(past_last.get("vwap"), past_close) - 1) * 100 if past_close else 0,
+            "range_pct": ((safe_float(past_slice["high"].max()) - safe_float(past_slice["low"].min())) / past_open) * 100 if past_open else 0,
+            "slope_pct": (linear_slope_per_bar(past_slice["close"], lookback=15) / past_close) * 100 if past_close else 0,
+        }
+
+        # Simple normalized distance. Lower is more similar.
+        dist = (
+            abs(current_features["ret_open"] - past_features["ret_open"]) / 2.0
+            + abs(current_features["vwap_gap"] - past_features["vwap_gap"]) / 1.0
+            + abs(current_features["range_pct"] - past_features["range_pct"]) / 2.0
+            + abs(current_features["slope_pct"] - past_features["slope_pct"]) / 0.05
+        )
+
+        future_ret_pct = (future_close / past_close - 1) * 100 if past_close else 0
+        if str(side) == "LONG":
+            supported = future_ret_pct > 0
+        else:
+            supported = future_ret_pct < 0
+
+        samples.append(
+            {
+                "day": str(day),
+                "dist": float(dist),
+                "future_ret_pct": float(future_ret_pct),
+                "supported": bool(supported),
+            }
+        )
+
+    if len(samples) < min_samples:
+        return {
+            "delta": 0,
+            "reason": f"היסטוריה: נמצאו רק {len(samples)} דוגמאות דומות, לא מספיק להשפעה.",
+        }
+
+    samples = sorted(samples, key=lambda x: x["dist"])[: max(min_samples, 5)]
+    support_rate = sum(1 for s in samples if s["supported"]) / len(samples)
+    avg_future_ret = float(np.mean([s["future_ret_pct"] for s in samples]))
+
+    delta = 0
+    if support_rate >= 0.75:
+        delta = max_bonus
+    elif support_rate >= 0.62:
+        delta = 1
+    elif support_rate <= 0.25:
+        delta = -max_penalty
+    elif support_rate <= 0.38:
+        delta = -1
+
+    direction_word = "לונג" if str(side) == "LONG" else "שורט"
+    reason = (
+        f"היסטוריה אחרי {elapsed:.0f} דק׳: מתוך {len(samples)} ימים דומים, "
+        f"{support_rate*100:.0f}% תמכו ב־{direction_word}. "
+        f"תנועה ממוצעת לאחר {horizon} דק׳: {avg_future_ret:.2f}%. "
+        f"שינוי ניקוד: {delta:+d}."
+    )
+
+    return {"delta": int(delta), "reason": reason}
+
+
 # ============================================================
 # Signal logic
 # ============================================================
@@ -959,6 +1148,9 @@ def make_signal(ticker, mode):
     stop = chart_plan["stop"]
     target = chart_plan["target"]
 
+    hist_adj = historical_pattern_adjustment(ticker, mode, side, d)
+    score = int(max(1, min(8, int(score) + int(hist_adj.get("delta", 0)))))
+
     return {
         "signal": side,
         "ticker": normalize_ticker(ticker),
@@ -967,7 +1159,7 @@ def make_signal(ticker, mode):
         "entry": float(entry),
         "stop": float(stop),
         "target": float(target),
-        "reason": " | ".join(reasons + [chart_plan["reason"]]),
+        "reason": " | ".join(reasons + [chart_plan["reason"], hist_adj.get("reason", "")]),
     }
 
 
@@ -1827,6 +2019,644 @@ def render_closed_trades(closed_trades):
     st.dataframe(display.style.apply(style_row, axis=1), use_container_width=True, hide_index=True)
 
 
+
+
+# ============================================================
+# Backtest / historical replay
+# ============================================================
+
+def make_signal_from_history(ticker, mode, hist_df):
+    """
+    Same signal logic, but using only candles available up to the current replay minute.
+    This prevents look-ahead bias in the backtest.
+    """
+    if hist_df is None or hist_df.empty:
+        return {"signal": "WAIT", "ticker": ticker, "mode": mode, "score": 0, "reason": "אין נתונים"}
+
+    d = add_indicators(hist_df).dropna(subset=["close"])
+    if d.empty:
+        return {"signal": "WAIT", "ticker": ticker, "mode": mode, "score": 0, "reason": "אין אינדיקטורים"}
+
+    if mode == "מהירה":
+        ls, lr = score_side_fast(d, "LONG")
+        ss, sr = score_side_fast(d, "SHORT")
+    else:
+        ls, lr = score_side_half(d, "LONG")
+        ss, sr = score_side_half(d, "SHORT")
+
+    entry = safe_float(d.iloc[-1]["close"])
+
+    if ls >= ss and ls >= 3:
+        side, score, reasons = "LONG", ls, lr
+    elif ss > ls and ss >= 3:
+        side, score, reasons = "SHORT", ss, sr
+    else:
+        return {
+            "signal": "WAIT",
+            "ticker": normalize_ticker(ticker),
+            "mode": mode,
+            "score": max(ls, ss),
+            "reason": f"לונג {ls}, שורט {ss} — אין יתרון ברור",
+        }
+
+    chart_plan = chart_based_stop_target(d, side, mode)
+    stop = chart_plan["stop"]
+    target = chart_plan["target"]
+
+    hist_adj = historical_pattern_adjustment(ticker, mode, side, d, current_time=d.index[-1])
+    score = int(max(1, min(8, int(score) + int(hist_adj.get("delta", 0)))))
+
+    return {
+        "signal": side,
+        "ticker": normalize_ticker(ticker),
+        "mode": mode,
+        "score": int(score),
+        "entry": float(entry),
+        "stop": float(stop),
+        "target": float(target),
+        "reason": " | ".join(reasons + [chart_plan.get("reason", ""), hist_adj.get("reason", "")]),
+    }
+
+
+def backtest_has_open_ticker(open_trades, ticker):
+    return any(t["status"] == "OPEN" and str(t["ticker"]) == str(ticker) for t in open_trades)
+
+
+def backtest_pending_exists(pending, ticker, mode):
+    """
+    Safe check for pending backtest candidates.
+    Older V5.5 candidates did not include 'status', so use .get().
+    """
+    return any(
+        p.get("status", "PENDING") == "PENDING"
+        and str(p.get("ticker", "")) == str(ticker)
+        and str(p.get("mode", "")) == str(mode)
+        for p in pending
+    )
+
+
+def backtest_breakeven_price(trade):
+    entry = safe_float(trade["entry_price"])
+    qty = safe_float(trade["quantity"])
+    if qty <= 0:
+        return entry
+
+    costs = {
+        "cost_pct_per_side": safe_float(trade["cost_pct_per_side"], DEFAULT_COSTS["cost_pct_per_side"]),
+        "fixed_fee_per_side": safe_float(trade["fixed_fee_per_side"], DEFAULT_COSTS["fixed_fee_per_side"]),
+        "min_fee_per_side": safe_float(trade["min_fee_per_side"], DEFAULT_COSTS["min_fee_per_side"]),
+    }
+    _, _, total_cost = estimate_costs(entry, entry, qty, costs)
+    buffer_per_share = total_cost / qty
+
+    if str(trade["side"]) == "LONG":
+        return entry + buffer_per_share
+    return entry - buffer_per_share
+
+
+def backtest_close_trade(trade, exit_price, exit_time, reason):
+    pnl = pnl_for_trade(trade, exit_price)
+
+    trade = dict(trade)
+    trade["status"] = "CLOSED"
+    trade["exit_price"] = float(exit_price)
+    trade["current_price"] = float(exit_price)
+    trade["exit_time"] = str(exit_time)
+    trade["duration_minutes"] = minutes_between(trade["entry_time"], str(exit_time))
+    trade["age_minutes"] = trade["duration_minutes"]
+    trade["exit_reason"] = reason
+    trade["exit_reason_he"] = exit_reason_he(reason)
+
+    for k, v in pnl.items():
+        trade[k] = v
+
+    return trade
+
+
+def backtest_open_trade_from_signal(signal, entry_time, costs, units, rules, min_score):
+    ticker = normalize_ticker(signal["ticker"])
+    mode = str(signal["mode"])
+    side = str(signal["signal"])
+    score = int(signal.get("score", 0))
+
+    if side not in ["LONG", "SHORT"]:
+        return None, f"{ticker}: אין איתות."
+    if score < int(min_score):
+        return None, f"{ticker}: ניקוד {score} נמוך מהמינימום."
+
+    entry = float(signal["entry"])
+    stop = float(signal["stop"])
+    target = float(signal["target"])
+
+    score_qty, score_notional, unit_mult = position_size(score, entry, units)
+    if score_qty <= 0 or score_notional <= 0:
+        return None, f"{ticker}: לפי יוניטים, ניקוד {score} לא מקבל כניסה."
+
+    qty, notional, risk_msg = apply_risk_cap_to_position(
+        side=side,
+        entry=entry,
+        stop=stop,
+        score_qty=score_qty,
+        score_notional=score_notional,
+        max_loss_dollars=float(rules.get("max_allowed_loss_per_trade_dollars", 7.0)),
+    )
+
+    if qty <= 0 or notional <= 0:
+        return None, f"{ticker}: {risk_msg}"
+
+    ok, eg, ec, en, msg = cost_tradeoff(side, entry, target, qty, costs)
+    if not ok:
+        return None, f"{ticker}: {msg}"
+
+    entry_cost, exit_cost, total_cost_now = estimate_costs(entry, entry, qty, costs)
+
+    trade = {
+        "trade_id": str(uuid.uuid4()),
+        "status": "OPEN",
+        "ticker": ticker,
+        "mode": mode,
+        "side": side,
+        "score": score,
+        "entry_time": str(entry_time),
+        "exit_time": "",
+        "duration_minutes": 0.0,
+        "age_minutes": 0.0,
+        "entry_price": entry,
+        "current_price": entry,
+        "exit_price": np.nan,
+        "quantity": qty,
+        "notional": notional,
+        "stop_loss": stop,
+        "initial_stop_loss": stop,
+        "manual_stop_loss": np.nan,
+        "profit_stop": np.nan,
+        "target_reference": target,
+        "breakeven_price": np.nan,
+        "highest_price": entry,
+        "lowest_price": entry,
+        "max_net_pnl_seen": -total_cost_now,
+        "entry_cost": entry_cost,
+        "exit_cost": exit_cost,
+        "total_cost": total_cost_now,
+        "gross_pnl": 0.0,
+        "net_pnl": -total_cost_now,
+        "net_pnl_pct": (-total_cost_now / notional) * 100 if notional else 0,
+        "exit_reason": "",
+        "exit_reason_he": "",
+        "management_action": "BACKTEST_OPENED",
+        "management_reason": "נפתחה בבקטסט אחרי אישור דקה.",
+        "signal_reason": signal.get("reason", ""),
+        "cost_pct_per_side": costs["cost_pct_per_side"],
+        "fixed_fee_per_side": costs["fixed_fee_per_side"],
+        "min_fee_per_side": costs["min_fee_per_side"],
+        "max_cost_to_target_pct": costs["max_cost_to_target_pct"],
+        "base_unit_dollars": units["base_unit_dollars"],
+        "unit_multiplier": unit_mult,
+        "created_settings_snapshot": json.dumps({"costs": costs, "units": units, "rules": rules}, ensure_ascii=False),
+    }
+    trade["breakeven_price"] = backtest_breakeven_price(trade)
+
+    return trade, f"{ticker}: נפתחה בבקטסט {side} | {mode} | ניקוד {score} | {risk_msg}"
+
+
+def backtest_update_trade(trade, hist_df, current_bar, current_time, rules):
+    """
+    Conservative historical trade management.
+    Uses only data up to current_time.
+    """
+    trade = dict(trade)
+
+    current = safe_float(current_bar["close"])
+    high = safe_float(current_bar["high"])
+    low = safe_float(current_bar["low"])
+
+    trade["current_price"] = current
+    trade["age_minutes"] = minutes_between(trade["entry_time"], str(current_time))
+    trade["duration_minutes"] = trade["age_minutes"]
+
+    side = str(trade["side"])
+    mode = str(trade["mode"])
+    score = int(safe_float(trade["score"], 1))
+    entry = safe_float(trade["entry_price"])
+    stop = safe_float(trade["stop_loss"])
+    target = safe_float(trade["target_reference"])
+    breakeven = safe_float(trade.get("breakeven_price"), backtest_breakeven_price(trade))
+
+    trade["highest_price"] = max(safe_float(trade.get("highest_price"), entry), high)
+    trade["lowest_price"] = min(safe_float(trade.get("lowest_price"), entry), low)
+
+    pnl = pnl_for_trade(trade, current)
+    current_net = pnl["net_pnl"]
+    trade["max_net_pnl_seen"] = max(safe_float(trade.get("max_net_pnl_seen"), current_net), current_net)
+
+    for k, v in pnl.items():
+        trade[k] = v
+
+    base_risk = abs(entry - safe_float(trade.get("initial_stop_loss"), stop))
+    if base_risk <= 0:
+        base_risk = max(entry * 0.001, abs(entry - stop))
+
+    d = add_indicators(hist_df).dropna(subset=["close"])
+    last = d.iloc[-1] if not d.empty else None
+    ema5 = safe_float(last["ema5"], current) if last is not None else current
+    ema5_slope = safe_float(last["ema5_slope"], 0) if last is not None else 0
+
+    last3 = d.tail(min(3, len(d))) if not d.empty else pd.DataFrame()
+    green = int((last3["close"] > last3["open"]).sum()) if not last3.empty else 0
+    red = int((last3["close"] < last3["open"]).sum()) if not last3.empty else 0
+
+    max_loss = abs(float(rules.get("max_allowed_loss_per_trade_dollars", 7.0)))
+    giveback_pct = float(rules.get("profit_giveback_pct", 10.0))
+    min_giveback_profit = float(rules.get("min_net_profit_for_giveback", 5.0))
+    breakeven_after = float(rules.get("breakeven_after_profit_dollars", 4.0))
+    lock_profit_after = float(rules.get("lock_profit_after_net_dollars", 8.0))
+    age = safe_float(trade["age_minutes"], 0)
+
+    # 1. Hard max loss after costs
+    if current_net <= -max_loss:
+        return backtest_close_trade(trade, current, current_time, "MAX_LOSS_LIMIT")
+
+    # 2. Hard stop using candle high/low
+    if side == "LONG" and low <= stop:
+        return backtest_close_trade(trade, stop, current_time, "STOP_LOSS")
+    if side == "SHORT" and high >= stop:
+        return backtest_close_trade(trade, stop, current_time, "STOP_LOSS")
+
+    # 3. Profit giveback
+    peak_profit = safe_float(trade.get("max_net_pnl_seen"), current_net)
+    if peak_profit >= min_giveback_profit:
+        allowed_drop = peak_profit * (giveback_pct / 100.0)
+        if current_net <= peak_profit - allowed_drop:
+            return backtest_close_trade(trade, current, current_time, "PROFIT_GIVEBACK")
+
+    # 4. Breakeven after costs if it was profitable
+    if bool(rules.get("exit_if_profitable_trade_turns_red", True)):
+        if side == "LONG" and peak_profit >= breakeven_after and current <= breakeven:
+            return backtest_close_trade(trade, current, current_time, "BREAKEVEN_AFTER_COSTS")
+        if side == "SHORT" and peak_profit >= breakeven_after and current >= breakeven:
+            return backtest_close_trade(trade, current, current_time, "BREAKEVEN_AFTER_COSTS")
+
+    # 5. No progress
+    if side == "LONG":
+        if mode == "מהירה" and age >= 3 and current_net <= 0 and red >= 2 and current < entry:
+            return backtest_close_trade(trade, current, current_time, "NO_PROGRESS_FAST")
+        if mode != "מהירה" and age >= 12 and current_net <= 0 and current < ema5 and ema5_slope < 0:
+            return backtest_close_trade(trade, current, current_time, "NO_PROGRESS_HALF")
+    else:
+        if mode == "מהירה" and age >= 3 and current_net <= 0 and green >= 2 and current > entry:
+            return backtest_close_trade(trade, current, current_time, "NO_PROGRESS_FAST")
+        if mode != "מהירה" and age >= 12 and current_net <= 0 and current > ema5 and ema5_slope > 0:
+            return backtest_close_trade(trade, current, current_time, "NO_PROGRESS_HALF")
+
+    # 6. Profit stop and target behavior
+    if side == "LONG":
+        if current_net >= breakeven_after:
+            new_profit_stop = max(breakeven, current - 0.35 * base_risk)
+            if not np.isfinite(safe_float(trade.get("profit_stop"), np.nan)) or new_profit_stop > safe_float(trade.get("profit_stop"), -np.inf):
+                trade["profit_stop"] = new_profit_stop
+
+        if peak_profit >= lock_profit_after:
+            new_profit_stop = max(breakeven, current - 0.18 * base_risk)
+            if not np.isfinite(safe_float(trade.get("profit_stop"), np.nan)) or new_profit_stop > safe_float(trade.get("profit_stop"), -np.inf):
+                trade["profit_stop"] = new_profit_stop
+
+        if np.isfinite(safe_float(trade.get("profit_stop"), np.nan)) and low <= safe_float(trade["profit_stop"]):
+            return backtest_close_trade(trade, safe_float(trade["profit_stop"]), current_time, "PROFIT_STOP")
+
+        if high >= target and score < int(rules.get("exit_on_target_when_score_below", 7)):
+            return backtest_close_trade(trade, target, current_time, "TARGET_REACHED_SCORE_EXIT")
+
+        if high >= target and score >= int(rules.get("exit_on_target_when_score_below", 7)) and current > ema5 and ema5_slope > 0:
+            trade["target_reference"] = max(target, current + 0.80 * base_risk)
+        elif high >= target:
+            return backtest_close_trade(trade, target, current_time, "TARGET_REACHED")
+
+    else:
+        if current_net >= breakeven_after:
+            new_profit_stop = min(breakeven, current + 0.35 * base_risk)
+            if not np.isfinite(safe_float(trade.get("profit_stop"), np.nan)) or new_profit_stop < safe_float(trade.get("profit_stop"), np.inf):
+                trade["profit_stop"] = new_profit_stop
+
+        if peak_profit >= lock_profit_after:
+            new_profit_stop = min(breakeven, current + 0.18 * base_risk)
+            if not np.isfinite(safe_float(trade.get("profit_stop"), np.nan)) or new_profit_stop < safe_float(trade.get("profit_stop"), np.inf):
+                trade["profit_stop"] = new_profit_stop
+
+        if np.isfinite(safe_float(trade.get("profit_stop"), np.nan)) and high >= safe_float(trade["profit_stop"]):
+            return backtest_close_trade(trade, safe_float(trade["profit_stop"]), current_time, "PROFIT_STOP")
+
+        if low <= target and score < int(rules.get("exit_on_target_when_score_below", 7)):
+            return backtest_close_trade(trade, target, current_time, "TARGET_REACHED_SCORE_EXIT")
+
+        if low <= target and score >= int(rules.get("exit_on_target_when_score_below", 7)) and current < ema5 and ema5_slope < 0:
+            trade["target_reference"] = min(target, current - 0.80 * base_risk)
+        elif low <= target:
+            return backtest_close_trade(trade, target, current_time, "TARGET_REACHED")
+
+    return trade
+
+
+@st.cache_data(show_spinner=False, ttl=120)
+def load_backtest_data_for_date(tickers_tuple, date_str):
+    """
+    Loads 1m data for selected tickers and extracts one trading date.
+    Cache avoids repeated yfinance calls.
+    """
+    selected_date = pd.to_datetime(date_str).date()
+    data = {}
+    missing = []
+
+    for ticker in tickers_tuple:
+        try:
+            df = fetch_1m(ticker)
+            if df is None or df.empty:
+                missing.append(ticker)
+                continue
+            day_df = df[df.index.date == selected_date].copy()
+            if day_df.empty:
+                missing.append(ticker)
+                continue
+            data[ticker] = day_df.sort_index()
+        except Exception:
+            missing.append(ticker)
+
+    return data, missing
+
+
+def run_day_backtest(tickers, date_value, modes, min_score, max_open, max_trades_total):
+    """
+    Replay a single historical day minute-by-minute.
+    This is a paper/backtest simulation only.
+    """
+    costs = load_costs()
+    units = load_units()
+    rules = load_rules()
+
+    date_str = str(pd.to_datetime(date_value).date())
+    data, missing = load_backtest_data_for_date(tuple(tickers), date_str)
+
+    if not data:
+        return {
+            "trades": pd.DataFrame(),
+            "summary": {},
+            "equity": pd.DataFrame(),
+            "messages": [f"לא נמצאו נתוני 1 דקה לתאריך {date_str}. ב־yfinance בדרך כלל צריך לבחור יום מהימים האחרונים."],
+            "missing": missing,
+        }
+
+    # Build unified timeline
+    all_times = sorted(set().union(*[set(df.index) for df in data.values()]))
+    if not all_times:
+        return {
+            "trades": pd.DataFrame(),
+            "summary": {},
+            "equity": pd.DataFrame(),
+            "messages": ["לא נמצאו נרות למסחר."],
+            "missing": missing,
+        }
+
+    open_trades = []
+    closed_trades = []
+    pending = []
+    messages = []
+    equity_points = []
+    total_opened = 0
+
+    confirm_seconds = float(rules.get("confirm_before_entry_seconds", 60))
+    pending_expire_seconds = float(rules.get("pending_signal_expire_minutes", 6)) * 60
+
+    for current_time in all_times:
+        # Update open trades
+        updated_open = []
+        for trade in open_trades:
+            ticker = trade["ticker"]
+            if ticker not in data:
+                updated_open.append(trade)
+                continue
+
+            hist = data[ticker][data[ticker].index <= current_time]
+            if hist.empty:
+                updated_open.append(trade)
+                continue
+
+            current_bar = hist.iloc[-1]
+            updated = backtest_update_trade(trade, hist, current_bar, current_time, rules)
+
+            if updated["status"] == "CLOSED":
+                closed_trades.append(updated)
+            else:
+                updated_open.append(updated)
+
+        open_trades = updated_open
+
+        # Process pending candidates
+        new_pending = []
+        for p in pending:
+            if p.get("status", "PENDING") != "PENDING":
+                continue
+
+            age_seconds = (current_time - p["created_at"]).total_seconds()
+            ticker = p["ticker"]
+            mode = p["mode"]
+
+            if age_seconds > pending_expire_seconds:
+                continue
+
+            if age_seconds < confirm_seconds:
+                new_pending.append(p)
+                continue
+
+            if total_opened >= int(max_trades_total):
+                continue
+
+            if len(open_trades) >= int(max_open):
+                new_pending.append(p)
+                continue
+
+            if backtest_has_open_ticker(open_trades, ticker):
+                continue
+
+            hist = data.get(ticker, pd.DataFrame())
+            hist = hist[hist.index <= current_time]
+            if hist.empty:
+                new_pending.append(p)
+                continue
+
+            new_signal = make_signal_from_history(ticker, mode, hist)
+            confirmed, confirm_msg = signal_confirmed_after_delay(
+                original_side=p["side"],
+                original_score=p["score"],
+                new_signal=new_signal,
+                min_score=min_score,
+            )
+
+            if not confirmed:
+                continue
+
+            trade, msg = backtest_open_trade_from_signal(
+                new_signal,
+                entry_time=current_time,
+                costs=costs,
+                units=units,
+                rules=rules,
+                min_score=min_score,
+            )
+
+            if trade is not None:
+                open_trades.append(trade)
+                total_opened += 1
+                messages.append(msg)
+
+        pending = new_pending
+
+        # Create new pending candidates if there is room
+        if total_opened < int(max_trades_total) and len(open_trades) < int(max_open):
+            for ticker, df in data.items():
+                if total_opened >= int(max_trades_total):
+                    break
+                if len(open_trades) >= int(max_open):
+                    break
+                if backtest_has_open_ticker(open_trades, ticker):
+                    continue
+
+                hist = df[df.index <= current_time]
+                if len(hist) < 15:
+                    continue
+
+                for mode in modes:
+                    if backtest_pending_exists(pending, ticker, mode):
+                        continue
+
+                    sig = make_signal_from_history(ticker, mode, hist)
+                    if sig.get("signal") not in ["LONG", "SHORT"]:
+                        continue
+                    if int(sig.get("score", 0)) < int(min_score):
+                        continue
+
+                    pending.append(
+                        {
+                            "pending_id": str(uuid.uuid4()),
+                            "created_at": current_time,
+                            "ticker": ticker,
+                            "mode": mode,
+                            "side": sig["signal"],
+                            "score": int(sig["score"]),
+                            "status": "PENDING",
+                            "message": "מועמדת בבקטסט מחכה לאישור חוזר.",
+                        }
+                    )
+
+        # Equity snapshot
+        closed_net = sum(safe_float(t.get("net_pnl"), 0) for t in closed_trades)
+        open_net = 0.0
+        for trade in open_trades:
+            try:
+                ticker = trade["ticker"]
+                hist = data[ticker][data[ticker].index <= current_time]
+                if not hist.empty:
+                    current_price = safe_float(hist.iloc[-1]["close"])
+                    open_net += pnl_for_trade(trade, current_price)["net_pnl"]
+            except Exception:
+                pass
+
+        equity_points.append(
+            {
+                "time": current_time,
+                "closed_net": closed_net,
+                "open_net": open_net,
+                "total_net": closed_net + open_net,
+                "open_trades": len(open_trades),
+                "closed_trades": len(closed_trades),
+            }
+        )
+
+    # Close remaining open trades at last available price
+    for trade in open_trades:
+        ticker = trade["ticker"]
+        df = data.get(ticker, pd.DataFrame())
+        if df.empty:
+            continue
+        last_bar = df.iloc[-1]
+        closed_trades.append(backtest_close_trade(trade, safe_float(last_bar["close"]), df.index[-1], "END_OF_DAY"))
+
+    trades_df = pd.DataFrame(closed_trades)
+    if not trades_df.empty:
+        for col in TRADE_COLUMNS:
+            if col not in trades_df.columns:
+                trades_df[col] = np.nan
+
+    equity_df = pd.DataFrame(equity_points)
+
+    if trades_df.empty:
+        summary = {
+            "trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "win_rate": 0.0,
+            "net": 0.0,
+            "gross": 0.0,
+            "costs": 0.0,
+        }
+    else:
+        net_series = pd.to_numeric(trades_df["net_pnl"], errors="coerce").fillna(0)
+        summary = {
+            "trades": int(len(trades_df)),
+            "wins": int((net_series > 0).sum()),
+            "losses": int((net_series < 0).sum()),
+            "win_rate": float((net_series > 0).mean() * 100),
+            "net": float(net_series.sum()),
+            "gross": float(pd.to_numeric(trades_df["gross_pnl"], errors="coerce").fillna(0).sum()),
+            "costs": float(pd.to_numeric(trades_df["total_cost"], errors="coerce").fillna(0).sum()),
+        }
+
+    return {
+        "trades": trades_df,
+        "summary": summary,
+        "equity": equity_df,
+        "messages": messages,
+        "missing": missing,
+    }
+
+
+def render_backtest_trades_table(trades_df):
+    if trades_df.empty:
+        st.info("הבקטסט לא פתח עסקאות ביום הזה.")
+        return
+
+    d = trades_df.copy().reset_index(drop=True)
+    d["exit_reason_he"] = d.apply(
+        lambda r: r["exit_reason_he"] if isinstance(r.get("exit_reason_he", ""), str) and r.get("exit_reason_he", "") else exit_reason_he(r.get("exit_reason", "")),
+        axis=1,
+    )
+
+    display = pd.DataFrame({
+        "מניה": d["ticker"],
+        "סוג": d["mode"],
+        "כיוון": d["side"],
+        "ניקוד": d["score"].fillna(0).astype(int),
+        "כניסה": d["entry_price"].map(fmt_price),
+        "יציאה": d["exit_price"].map(fmt_price),
+        "סטופ": d["stop_loss"].map(fmt_price),
+        "TP": d["target_reference"].map(fmt_price),
+        "רווח/הפסד נטו": d["net_pnl"].map(fmt_money),
+        "עלות": d["total_cost"].map(fmt_money),
+        "זמן כניסה": d["entry_time"].astype(str).str.slice(0, 19),
+        "זמן יציאה": d["exit_time"].astype(str).str.slice(0, 19),
+        "משך דק׳": d["duration_minutes"].map(fmt_minutes),
+        "סיבת יציאה": d["exit_reason_he"],
+    })
+
+    pnl_values = pd.to_numeric(d["net_pnl"], errors="coerce").fillna(0).tolist()
+
+    def style_row(row):
+        pnl = pnl_values[row.name]
+        if pnl >= 0:
+            return ["background-color:#dcfce7;color:#064e3b;"] * len(row)
+        return ["background-color:#fee2e2;color:#7f1d1d;"] * len(row)
+
+    st.dataframe(display.style.apply(style_row, axis=1), use_container_width=True, hide_index=True)
+
+
 # ============================================================
 # Main UI
 # ============================================================
@@ -1834,19 +2664,20 @@ def render_closed_trades(closed_trades):
 st.markdown(
     """
 <div class="title-box">
-<h1>🧪 Paper Trading Lab V5.4</h1>
+<h1>🧪 Paper Trading Lab V5.7</h1>
 <p>אפליקציית Paper Trading נקייה: יעד מחזור 50$, סטופ ידני, סיבות יציאה, Break-even אחרי עלויות וצמצום הפסדים.</p>
 </div>
 """,
     unsafe_allow_html=True,
 )
 
-tab_paper, tab_costs, tab_units, tab_rules, tab_account, tab_help = st.tabs([
+tab_paper, tab_costs, tab_units, tab_rules, tab_account, tab_backtest, tab_help = st.tabs([
     "🧪 Paper Trading",
     "💸 עלויות",
     "📦 יוניטים לפי ניקוד",
     "⚙️ חוקים חכמים",
     "🏦 חשבון ומחזורים",
+    "📊 Backtest יום מסחר",
     "📘 הסבר",
 ])
 
@@ -2036,6 +2867,10 @@ with tab_rules:
         min_giveback_profit = st.number_input("מינימום רווח נטו להפעלת ירידת רווח ($)", 0.0, 1000.0, float(rules.get("min_net_profit_for_giveback", 5.0)), 1.0)
         confirm_seconds = st.number_input("כמה שניות לחכות לפני כניסה אחרי זיהוי עסקה", 10, 600, int(rules.get("confirm_before_entry_seconds", 60)))
         pending_expire = st.number_input("אחרי כמה דקות מועמדת פגה", 1, 60, int(rules.get("pending_signal_expire_minutes", 6)))
+        history_after = st.number_input("להפעיל היסטוריה אחרי כמה דקות מהפתיחה", 0, 240, int(rules.get("use_history_after_minutes", 30)))
+        history_min_samples = st.number_input("מינימום ימים דומים להשפעה היסטורית", 1, 10, int(rules.get("history_min_samples", 2)))
+        history_bonus = st.number_input("מקסימום תוספת ניקוד מהיסטוריה", 0, 4, int(rules.get("history_max_score_bonus", 2)))
+        history_penalty = st.number_input("מקסימום הורדת ניקוד מהיסטוריה", 0, 4, int(rules.get("history_max_score_penalty", 2)))
         exit_score_below = st.slider("לצאת ביעד אם ניקוד נמוך מ־", 1, 9, int(rules["exit_on_target_when_score_below"]))
 
     exit_turn_red = st.checkbox(
@@ -2073,6 +2908,10 @@ with tab_rules:
             "min_net_profit_for_giveback": float(min_giveback_profit),
             "confirm_before_entry_seconds": int(confirm_seconds),
             "pending_signal_expire_minutes": int(pending_expire),
+            "use_history_after_minutes": int(history_after),
+            "history_min_samples": int(history_min_samples),
+            "history_max_score_bonus": int(history_bonus),
+            "history_max_score_penalty": int(history_penalty),
         })
         st.success("נשמר.")
 
@@ -2112,6 +2951,165 @@ with tab_account:
             st.success("המחזורים אופסו, העסקאות לא נמחקו.")
 
 
+with tab_backtest:
+    st.subheader("📊 Backtest יום מסחר")
+
+    st.markdown(
+        """
+<div class="card warn">
+<strong>בדמו בלבד:</strong> הבקטסט הוא סימולציה היסטורית. הוא לא מבטיח תוצאה עתידית ולא משתמש בכסף אמיתי.
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+    bt1, bt2, bt3 = st.columns([1.3, 1.3, 1.2])
+
+    with bt1:
+        bt_tickers_all = load_tickers()
+        bt_tickers = st.multiselect(
+            "מניות לבדיקה",
+            bt_tickers_all,
+            default=bt_tickers_all[:min(6, len(bt_tickers_all))],
+            key="bt_tickers",
+        )
+
+        bt_date = st.date_input(
+            "תאריך מסחר לבדיקה",
+            value=pd.Timestamp.now(tz=NY_TZ).date(),
+            key="bt_date",
+        )
+
+    with bt2:
+        bt_modes = st.multiselect(
+            "סוג השקעה",
+            ["מהירה", "חצי שעה"],
+            default=["מהירה", "חצי שעה"],
+            key="bt_modes",
+        )
+
+        bt_min_score = st.slider(
+            "מינימום ניקוד בבקטסט",
+            1,
+            8,
+            8,
+            key="bt_min_score",
+        )
+
+    with bt3:
+        bt_max_open = st.number_input(
+            "מקסימום עסקאות פתוחות במקביל",
+            1,
+            20,
+            4,
+            key="bt_max_open",
+        )
+
+        bt_max_total = st.number_input(
+            "מקסימום עסקאות בכל היום",
+            1,
+            200,
+            30,
+            key="bt_max_total",
+        )
+
+        run_bt = st.button("▶️ הרץ Backtest", use_container_width=True, key="run_backtest")
+
+    st.caption("הבקטסט עובר נר־נר לפי נתוני 1 דקה. עם yfinance הכי אמין לבחור יום מהימים האחרונים.")
+
+    if run_bt:
+        if not bt_tickers:
+            st.warning("בחר לפחות מניה אחת.")
+        elif not bt_modes:
+            st.warning("בחר לפחות סוג השקעה אחד.")
+        else:
+            with st.spinner("מריץ Backtest דקה־דקה..."):
+                result = run_day_backtest(
+                    tickers=bt_tickers,
+                    date_value=bt_date,
+                    modes=bt_modes,
+                    min_score=bt_min_score,
+                    max_open=bt_max_open,
+                    max_trades_total=bt_max_total,
+                )
+
+            summary = result["summary"]
+            trades_df = result["trades"]
+            equity_df = result["equity"]
+            missing = result["missing"]
+
+            if missing:
+                st.warning("לא נמצאו נתונים לתאריך הזה עבור: " + ", ".join(missing[:20]))
+
+            if summary:
+                s1, s2, s3, s4 = st.columns(4)
+                s1.metric("רווח נטו בבקטסט", fmt_money(summary.get("net", 0)))
+                s2.metric("רווח ברוטו", fmt_money(summary.get("gross", 0)))
+                s3.metric("סך עלויות", fmt_money(summary.get("costs", 0)))
+                s4.metric("אחוז הצלחה", f"{summary.get('win_rate', 0):.1f}%")
+
+                s5, s6, s7 = st.columns(3)
+                s5.metric("כמות עסקאות", summary.get("trades", 0))
+                s6.metric("עסקאות מרוויחות", summary.get("wins", 0))
+                s7.metric("עסקאות מפסידות", summary.get("losses", 0))
+
+            if not equity_df.empty:
+                fig = go.Figure()
+                fig.add_trace(
+                    go.Scatter(
+                        x=equity_df["time"],
+                        y=equity_df["total_net"],
+                        mode="lines",
+                        name="Equity נטו",
+                    )
+                )
+                fig.update_layout(
+                    title="גרף רווח נטו במהלך היום",
+                    height=420,
+                    margin=dict(l=10, r=10, t=50, b=10),
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+            st.markdown("### עסקאות Backtest")
+            render_backtest_trades_table(trades_df)
+
+            if not trades_df.empty:
+                st.markdown("### ניתוח לפי מניה")
+                by_ticker = (
+                    trades_df.assign(net_pnl_num=pd.to_numeric(trades_df["net_pnl"], errors="coerce").fillna(0))
+                    .groupby("ticker")
+                    .agg(
+                        עסקאות=("trade_id", "count"),
+                        רווח_נטו=("net_pnl_num", "sum"),
+                        ממוצע=("net_pnl_num", "mean"),
+                    )
+                    .reset_index()
+                    .sort_values("רווח_נטו", ascending=False)
+                )
+                st.dataframe(by_ticker, use_container_width=True, hide_index=True)
+
+                st.markdown("### ניתוח לפי סיבת יציאה")
+                reason_df = trades_df.copy()
+                reason_df["net_pnl_num"] = pd.to_numeric(reason_df["net_pnl"], errors="coerce").fillna(0)
+                reason_df["סיבת יציאה"] = reason_df["exit_reason_he"].fillna(reason_df["exit_reason"])
+                by_reason = (
+                    reason_df.groupby("סיבת יציאה")
+                    .agg(
+                        עסקאות=("trade_id", "count"),
+                        רווח_נטו=("net_pnl_num", "sum"),
+                        ממוצע=("net_pnl_num", "mean"),
+                    )
+                    .reset_index()
+                    .sort_values("רווח_נטו", ascending=False)
+                )
+                st.dataframe(by_reason, use_container_width=True, hide_index=True)
+
+            if result["messages"]:
+                with st.expander("לוג פתיחות בבקטסט"):
+                    for msg in result["messages"][:120]:
+                        st.write(msg)
+
+
 with tab_help:
     st.subheader("📘 הסבר")
     st.markdown(
@@ -2144,7 +3142,7 @@ with tab_help:
 - ווליום
 - מבנה נרות
 
-### מה נוסף ב־V5.4?
+### מה נוסף ב־V5.7?
 
 **זמן יציאה ומשך עסקה**  
 בכל עסקה סגורה מופיע זמן יציאה וגם משך העסקה בדקות.
