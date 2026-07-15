@@ -1,12 +1,19 @@
 
 import json
+import html
 import time
 import uuid
+import urllib.parse
+import urllib.request
+import ssl
+import requests
+import certifi
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 import yfinance as yf
 import plotly.graph_objects as go
 
@@ -15,7 +22,7 @@ import plotly.graph_objects as go
 # App setup
 # ============================================================
 
-st.set_page_config(page_title="Paper Trading Lab V5.7", page_icon="🧪", layout="wide")
+st.set_page_config(page_title="Paper Trading Lab V6.4", page_icon="🧪", layout="wide")
 
 DATA_DIR = Path("paper_data")
 DATA_DIR.mkdir(exist_ok=True)
@@ -27,16 +34,23 @@ UNITS_FILE = DATA_DIR / "units_v3.json"
 RULES_FILE = DATA_DIR / "rules_v3.json"
 ACCOUNT_FILE = DATA_DIR / "account_v3.json"
 PENDING_FILE = DATA_DIR / "pending_signals_v5.csv"
+ALERTS_FILE = DATA_DIR / "alerts_v5_8.csv"
+ALERT_SETTINGS_FILE = DATA_DIR / "alert_settings_v5_8.json"
 
 NY_TZ = "America/New_York"
 
+BLOCKED_TICKERS = [
+    # Removed after the 2026-07-13 paper-trade report because they damaged performance.
+    "ADBE", "MSFT", "BABA", "COIN", "SMCI", "UBER", "LLY",
+]
+
 DEFAULT_TICKERS = [
     "QQQ", "SPY", "IWM", "DIA", "TQQQ", "SQQQ",
-    "AAPL", "MSFT", "NVDA", "AMD", "AVGO", "ARM", "INTC", "MU", "MRVL", "SMCI",
+    "AAPL", "NVDA", "AMD", "AVGO", "ARM", "INTC", "MU", "MRVL",
     "TSLA", "META", "GOOGL", "AMZN", "NFLX",
-    "PLTR", "MSTR", "COIN", "HOOD", "SOFI", "UBER", "SHOP", "SNOW",
-    "CRM", "ORCL", "ADBE", "PANW", "CRWD", "BABA",
-    "JPM", "BAC", "XOM", "CVX", "LLY", "UNH",
+    "PLTR", "MSTR", "HOOD", "SOFI", "SHOP", "SNOW",
+    "CRM", "ORCL", "PANW", "CRWD",
+    "JPM", "BAC", "XOM", "CVX", "UNH",
 ]
 
 DEFAULT_COSTS = {
@@ -88,6 +102,34 @@ DEFAULT_ACCOUNT = {
     "last_cycle_closed_at": "",
     "last_cycle_reason": "",
 }
+
+DEFAULT_ALERT_SETTINGS = {
+    "alerts_enabled": False,
+    "telegram_enabled": False,
+    "telegram_bot_token": "",
+    "telegram_chat_id": "",
+    "send_only_score_at_least": 8,
+    "include_reason": True,
+}
+
+ALERT_COLUMNS = [
+    "alert_id",
+    "created_at",
+    "trade_id",
+    "ticker",
+    "mode",
+    "side",
+    "score",
+    "entry_price",
+    "stop_loss",
+    "target_reference",
+    "net_pnl_expected",
+    "risk_note",
+    "tradingview_url",
+    "telegram_sent",
+    "telegram_error",
+    "message",
+]
 
 TRADE_COLUMNS = [
     "trade_id", "status", "ticker", "mode", "side", "score",
@@ -175,6 +217,19 @@ def normalize_ticker(t):
         t = t.split(":")[-1]
     return t.replace(" ", "")
 
+
+def is_blocked_ticker(ticker):
+    return normalize_ticker(ticker) in set(BLOCKED_TICKERS)
+
+
+def filter_allowed_tickers(tickers):
+    out = []
+    for t in tickers or []:
+        nt = normalize_ticker(t)
+        if nt and not is_blocked_ticker(nt):
+            out.append(nt)
+    return sorted(set(out))
+
 def read_json(path, default):
     if not path.exists() or path.stat().st_size == 0:
         return default
@@ -197,13 +252,13 @@ def write_json(path, data):
 
 def load_tickers():
     data = read_json(TICKERS_FILE, {"tickers": DEFAULT_TICKERS})
-    tickers = sorted(set(normalize_ticker(x) for x in data.get("tickers", DEFAULT_TICKERS) if normalize_ticker(x)))
+    tickers = filter_allowed_tickers(data.get("tickers", DEFAULT_TICKERS))
     if len(tickers) < 20:
-        tickers = sorted(set(tickers + DEFAULT_TICKERS))
+        tickers = filter_allowed_tickers(tickers + DEFAULT_TICKERS)
     return tickers
 
 def save_tickers(tickers):
-    write_json(TICKERS_FILE, {"tickers": sorted(set(normalize_ticker(x) for x in tickers if normalize_ticker(x)))})
+    write_json(TICKERS_FILE, {"tickers": filter_allowed_tickers(tickers)})
 
 def load_costs():
     return read_json(COSTS_FILE, DEFAULT_COSTS)
@@ -271,29 +326,104 @@ def exit_reason_he(reason):
 
 
 def empty_trades():
-    return pd.DataFrame(columns=TRADE_COLUMNS)
+    df = pd.DataFrame(columns=TRADE_COLUMNS)
+    for col in TRADE_COLUMNS:
+        df[col] = df[col].astype("object")
+    return df
+
+
+def normalize_trade_dtypes(df):
+    """
+    Newer pandas versions can infer empty/text columns as float64 from CSV.
+    Then assigning timestamps like 2026-07-13T... into exit_time crashes.
+    This function forces text/date/status columns to object dtype.
+    """
+    if df is None:
+        return empty_trades()
+
+    for col in TRADE_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+
+    df = df[TRADE_COLUMNS].copy()
+
+    text_cols = [
+        "trade_id",
+        "status",
+        "ticker",
+        "mode",
+        "side",
+        "entry_time",
+        "exit_time",
+        "exit_reason",
+        "exit_reason_he",
+        "management_action",
+        "management_reason",
+        "signal_reason",
+        "created_settings_snapshot",
+    ]
+
+    num_cols = [
+        "score",
+        "duration_minutes",
+        "age_minutes",
+        "entry_price",
+        "current_price",
+        "exit_price",
+        "quantity",
+        "notional",
+        "stop_loss",
+        "initial_stop_loss",
+        "manual_stop_loss",
+        "profit_stop",
+        "target_reference",
+        "breakeven_price",
+        "highest_price",
+        "lowest_price",
+        "max_net_pnl_seen",
+        "entry_cost",
+        "exit_cost",
+        "total_cost",
+        "gross_pnl",
+        "net_pnl",
+        "net_pnl_pct",
+        "cost_pct_per_side",
+        "fixed_fee_per_side",
+        "min_fee_per_side",
+        "max_cost_to_target_pct",
+        "base_unit_dollars",
+        "unit_multiplier",
+    ]
+
+    for col in text_cols:
+        if col in df.columns:
+            df[col] = df[col].astype("object").where(pd.notna(df[col]), "")
+
+    for col in num_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    return df[TRADE_COLUMNS]
+
 
 def load_trades():
     if not TRADES_FILE.exists() or TRADES_FILE.stat().st_size == 0:
         return empty_trades()
     try:
         df = pd.read_csv(TRADES_FILE)
+    except pd.errors.EmptyDataError:
+        return empty_trades()
     except Exception:
         return empty_trades()
+    return normalize_trade_dtypes(df)
 
-    for col in TRADE_COLUMNS:
-        if col not in df.columns:
-            df[col] = np.nan
-    return df[TRADE_COLUMNS]
 
 def save_trades(df):
     if df is None or df.empty:
         empty_trades().to_csv(TRADES_FILE, index=False)
         return
-    for col in TRADE_COLUMNS:
-        if col not in df.columns:
-            df[col] = np.nan
-    df[TRADE_COLUMNS].to_csv(TRADES_FILE, index=False)
+    df = normalize_trade_dtypes(df)
+    df.to_csv(TRADES_FILE, index=False)
 
 def clear_trades():
     save_trades(empty_trades())
@@ -515,6 +645,245 @@ def process_pending_signals(min_score, max_new_override=None, max_open_override=
 
     save_pending(pending)
     return messages
+
+
+
+
+# ============================================================
+# Alerts / Telegram
+# ============================================================
+
+def load_alert_settings():
+    return read_json(ALERT_SETTINGS_FILE, DEFAULT_ALERT_SETTINGS)
+
+
+def save_alert_settings(settings):
+    safe = dict(DEFAULT_ALERT_SETTINGS)
+    safe.update(settings or {})
+    write_json(ALERT_SETTINGS_FILE, safe)
+
+
+def empty_alerts():
+    df = pd.DataFrame(columns=ALERT_COLUMNS)
+    for col in ALERT_COLUMNS:
+        df[col] = df[col].astype("object")
+    return df
+
+
+def load_alerts():
+    if not ALERTS_FILE.exists() or ALERTS_FILE.stat().st_size == 0:
+        return empty_alerts()
+    try:
+        df = pd.read_csv(ALERTS_FILE)
+    except pd.errors.EmptyDataError:
+        return empty_alerts()
+    except Exception:
+        return empty_alerts()
+
+    for col in ALERT_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+
+    df = df[ALERT_COLUMNS].copy()
+
+    text_cols = [
+        "alert_id", "created_at", "trade_id", "ticker", "mode", "side",
+        "risk_note", "tradingview_url", "telegram_sent", "telegram_error", "message",
+    ]
+    num_cols = ["score", "entry_price", "stop_loss", "target_reference", "net_pnl_expected"]
+
+    for col in text_cols:
+        df[col] = df[col].astype("object").where(pd.notna(df[col]), "")
+
+    for col in num_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    return df[ALERT_COLUMNS]
+
+
+def save_alerts(df):
+    if df is None or df.empty:
+        empty_alerts().to_csv(ALERTS_FILE, index=False)
+        return
+
+    for col in ALERT_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+
+    df = df[ALERT_COLUMNS].copy()
+    df.to_csv(ALERTS_FILE, index=False)
+
+
+def clear_alerts():
+    save_alerts(empty_alerts())
+
+
+def tradingview_symbol(ticker):
+    t = normalize_ticker(ticker)
+    return f"NASDAQ:{t}"
+
+
+def tradingview_chart_url(ticker):
+    symbol = urllib.parse.quote(tradingview_symbol(ticker), safe="")
+    return f"https://www.tradingview.com/chart/?symbol={symbol}"
+
+
+def build_alert_message(row, expected_net=None, risk_note="", include_reason=True):
+    """
+    Simple English-only Telegram alert message.
+
+    Format:
+    🟢 LONG 📈
+    NVDA
+    Stop Loss: 183.70
+    Take Profit: 185.10
+
+    or:
+
+    🔴 SHORT 📉
+    NVDA
+    Stop Loss: 183.70
+    Take Profit: 185.10
+    """
+    ticker = str(row.get("ticker", "")).upper()
+    side = str(row.get("side", "")).upper()
+    stop = safe_float(row.get("stop_loss"), np.nan)
+    target = safe_float(row.get("target_reference"), np.nan)
+
+    if side == "LONG":
+        direction = "🟢 LONG 📈"
+    elif side == "SHORT":
+        direction = "🔴 SHORT 📉"
+    else:
+        direction = "⚪ SIGNAL"
+
+    return (
+        f"{direction}\n"
+        f"{ticker}\n"
+        f"Stop Loss: {stop:.2f}\n"
+        f"Take Profit: {target:.2f}"
+    )
+
+
+def send_telegram_message(bot_token, chat_id, message):
+    """
+    Send Telegram message using requests + certifi.
+
+    This avoids common SSL errors such as:
+    CERTIFICATE_VERIFY_FAILED / self-signed certificate in certificate chain
+
+    We do NOT disable SSL verification. We use certifi's trusted CA bundle.
+    """
+    if not bot_token or not chat_id:
+        return False, "חסר Bot Token או Chat ID."
+
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {
+        "chat_id": str(chat_id),
+        "text": str(message),
+        "disable_web_page_preview": False,
+    }
+
+    # Preferred path: requests with certifi CA bundle
+    try:
+        resp = requests.post(url, data=payload, timeout=15, verify=certifi.where())
+        if 200 <= resp.status_code < 300:
+            return True, ""
+        return False, resp.text[:500]
+    except requests.exceptions.SSLError as e:
+        # Fallback path: urllib with certifi SSL context
+        try:
+            data = urllib.parse.urlencode(
+                {
+                    "chat_id": str(chat_id),
+                    "text": str(message),
+                    "disable_web_page_preview": "false",
+                }
+            ).encode("utf-8")
+
+            context = ssl.create_default_context(cafile=certifi.where())
+            req = urllib.request.Request(url, data=data, method="POST")
+            with urllib.request.urlopen(req, timeout=15, context=context) as resp:
+                body = resp.read().decode("utf-8", errors="ignore")
+                if 200 <= resp.status < 300:
+                    return True, ""
+                return False, body[:500]
+        except Exception as e2:
+            return (
+                False,
+                "שגיאת SSL גם אחרי certifi. "
+                "במחשב Mac נסה להריץ Install Certificates.command או לעדכן certifi. "
+                f"פירוט: {str(e2)[:300]}",
+            )
+    except Exception as e:
+        return False, str(e)[:500]
+
+
+def create_trade_alert(row, expected_net=None, risk_note=""):
+    settings = load_alert_settings()
+    score = int(safe_float(row.get("score", 0), 0))
+    tv_url = tradingview_chart_url(row.get("ticker", ""))
+    include_reason = bool(settings.get("include_reason", True))
+    message = build_alert_message(
+        row=row,
+        expected_net=expected_net,
+        risk_note=risk_note,
+        include_reason=include_reason,
+    )
+
+    telegram_sent = False
+    telegram_error = ""
+
+    if bool(settings.get("alerts_enabled", False)) and bool(settings.get("telegram_enabled", False)):
+        if score >= int(settings.get("send_only_score_at_least", 8)):
+            telegram_sent, telegram_error = send_telegram_message(
+                bot_token=str(settings.get("telegram_bot_token", "")),
+                chat_id=str(settings.get("telegram_chat_id", "")),
+                message=message,
+            )
+        else:
+            telegram_error = f"לא נשלח לטלגרם כי הניקוד {score} נמוך מסף ההתראה."
+    else:
+        telegram_error = "התראות טלגרם כבויות."
+
+    alerts = load_alerts()
+    alert_row = {
+        "alert_id": str(uuid.uuid4()),
+        "created_at": now_ny_iso(),
+        "trade_id": str(row.get("trade_id", "")),
+        "ticker": str(row.get("ticker", "")),
+        "mode": str(row.get("mode", "")),
+        "side": str(row.get("side", "")),
+        "score": score,
+        "entry_price": safe_float(row.get("entry_price"), np.nan),
+        "stop_loss": safe_float(row.get("stop_loss"), np.nan),
+        "target_reference": safe_float(row.get("target_reference"), np.nan),
+        "net_pnl_expected": expected_net if expected_net is not None else np.nan,
+        "risk_note": risk_note,
+        "tradingview_url": tv_url,
+        "telegram_sent": "כן" if telegram_sent else "לא",
+        "telegram_error": telegram_error,
+        "message": message,
+    }
+
+    alerts = pd.concat([alerts, pd.DataFrame([alert_row])], ignore_index=True)
+    save_alerts(alerts)
+
+    return telegram_sent, telegram_error
+
+
+def send_test_telegram_alert():
+    settings = load_alert_settings()
+    test_msg = (
+        "✅ בדיקת Telegram Alerts הצליחה\\n\\n"
+        "האפליקציה תוכל לשלוח התראה כאשר עסקת Paper מאושרת אחרי בדיקת הדקה.\\n\\n"
+        "בדמו בלבד — לא כסף אמיתי."
+    )
+    return send_telegram_message(
+        bot_token=str(settings.get("telegram_bot_token", "")),
+        chat_id=str(settings.get("telegram_chat_id", "")),
+        message=test_msg,
+    )
 
 
 # ============================================================
@@ -1024,6 +1393,121 @@ def historical_pattern_adjustment(ticker, mode, side, current_session_df, curren
     return {"delta": int(delta), "reason": reason}
 
 
+
+# ============================================================
+# Conservative quality filters from the trade report
+# ============================================================
+
+def market_allows_short_live(mode):
+    """
+    Conservative live-only market filter for shorts.
+    For live scans, short is allowed only if the broad market also looks weak.
+    In backtest we avoid using live QQQ data to prevent look-ahead bias.
+    """
+    try:
+        q = latest_session(fetch_1m("QQQ"))
+        if q is None or q.empty:
+            return False, "Short blocked: QQQ data unavailable."
+
+        q = add_indicators(q).dropna(subset=["close"])
+        if q.empty:
+            return False, "Short blocked: QQQ indicators unavailable."
+
+        last = q.iloc[-1]
+        close = safe_float(last["close"])
+
+        if str(mode) == "מהירה":
+            ok = (
+                close < safe_float(last["vwap"])
+                and close < safe_float(last["ema9"])
+                and safe_float(last["ema3"]) < safe_float(last["ema5"])
+                and safe_float(last["ema3_slope"], 0) < 0
+                and safe_float(last["ema5_slope"], 0) < 0
+            )
+        else:
+            ok = (
+                close < safe_float(last["vwap"])
+                and close < safe_float(last["ema50"])
+                and safe_float(last["ema9"]) < safe_float(last["ema21"])
+                and safe_float(last["ema9_slope"], 0) < 0
+                and safe_float(last["ema21_slope"], 0) < 0
+            )
+
+        if ok:
+            return True, "Market filter: QQQ also bearish."
+        return False, "Short blocked: QQQ is not bearish enough."
+    except Exception as e:
+        return False, f"Short blocked: market filter error {str(e)[:80]}"
+
+
+def strict_short_quality_filter(d, mode, score, use_market_filter=True):
+    """
+    Based on the latest paper report, shorts were the weak side.
+    So shorts require:
+    - final score 8
+    - clean bearish structure on the traded ticker
+    - in live scans, QQQ must also be bearish
+    """
+    if d is None or d.empty:
+        return False, "Short blocked: no data."
+
+    last = d.iloc[-1]
+    close = safe_float(last["close"])
+
+    if int(score) < 8:
+        return False, f"Short blocked: score {int(score)} is below required 8."
+
+    if str(mode) == "מהירה":
+        ticker_ok = (
+            close < safe_float(last["vwap"])
+            and close < safe_float(last["ema9"])
+            and safe_float(last["ema3"]) < safe_float(last["ema5"])
+            and safe_float(last["ema3_slope"], 0) < 0
+            and safe_float(last["ema5_slope"], 0) < 0
+            and safe_float(last["mom2_pct"], 0) < -0.03
+        )
+    else:
+        ticker_ok = (
+            close < safe_float(last["vwap"])
+            and close < safe_float(last["ema50"])
+            and safe_float(last["ema9"]) < safe_float(last["ema21"])
+            and safe_float(last["ema9_slope"], 0) < 0
+            and safe_float(last["ema21_slope"], 0) < 0
+            and safe_float(last["mom30_pct"], 0) < -0.05
+        )
+
+    if not ticker_ok:
+        return False, "Short blocked: ticker bearish structure is not strong enough."
+
+    if use_market_filter:
+        market_ok, market_msg = market_allows_short_live(mode)
+        if not market_ok:
+            return False, market_msg
+        return True, "Strict short filter passed. " + market_msg
+
+    return True, "Strict short filter passed."
+
+
+def after_30_min_quality_filter(side, score, hist_adj, current_time):
+    """
+    After 30 minutes from market open we only allow very clean setups:
+    - score must be 8
+    - historical adjustment must not be negative
+    """
+    elapsed = session_minutes_from_open(current_time)
+    if elapsed < 30:
+        return True, f"Time filter not active yet: {elapsed:.0f} minutes from open."
+
+    delta = int(hist_adj.get("delta", 0))
+    if int(score) < 8:
+        return False, f"After-30 filter blocked: score {int(score)} below 8."
+
+    if delta < 0:
+        return False, f"After-30 filter blocked: history delta {delta:+d} is negative."
+
+    return True, f"After-30 filter passed: elapsed {elapsed:.0f} minutes, history delta {delta:+d}."
+
+
 # ============================================================
 # Signal logic
 # ============================================================
@@ -1115,6 +1599,10 @@ def score_side_half(d, side):
     return int(max(1, min(8, score))), reasons
 
 def make_signal(ticker, mode):
+    ticker = normalize_ticker(ticker)
+    if is_blocked_ticker(ticker):
+        return {"signal": "WAIT", "ticker": ticker, "mode": mode, "score": 0, "reason": "Blocked ticker from avoid list."}
+
     df = latest_session(fetch_1m(ticker))
     if df.empty:
         return {"signal": "WAIT", "ticker": ticker, "mode": mode, "score": 0, "reason": "אין נתונים"}
@@ -1151,6 +1639,30 @@ def make_signal(ticker, mode):
     hist_adj = historical_pattern_adjustment(ticker, mode, side, d)
     score = int(max(1, min(8, int(score) + int(hist_adj.get("delta", 0)))))
 
+    time_ok, time_msg = after_30_min_quality_filter(side, score, hist_adj, d.index[-1])
+    if not time_ok:
+        return {
+            "signal": "WAIT",
+            "ticker": normalize_ticker(ticker),
+            "mode": mode,
+            "score": int(score),
+            "reason": time_msg,
+        }
+
+    extra_reasons = [chart_plan["reason"], hist_adj.get("reason", ""), time_msg]
+
+    if side == "SHORT":
+        short_ok, short_msg = strict_short_quality_filter(d, mode, score, use_market_filter=True)
+        if not short_ok:
+            return {
+                "signal": "WAIT",
+                "ticker": normalize_ticker(ticker),
+                "mode": mode,
+                "score": int(score),
+                "reason": short_msg,
+            }
+        extra_reasons.append(short_msg)
+
     return {
         "signal": side,
         "ticker": normalize_ticker(ticker),
@@ -1159,7 +1671,7 @@ def make_signal(ticker, mode):
         "entry": float(entry),
         "stop": float(stop),
         "target": float(target),
-        "reason": " | ".join(reasons + [chart_plan["reason"], hist_adj.get("reason", "")]),
+        "reason": " | ".join(reasons + extra_reasons),
     }
 
 
@@ -1366,7 +1878,12 @@ def open_trade(signal, min_score):
     trades = pd.concat([trades, pd.DataFrame([row])], ignore_index=True)
     save_trades(trades)
 
-    return True, f"{ticker}: נפתחה {side} | {mode} | ניקוד {score} | יוניטים {unit_mult} | {risk_msg} | נטו צפוי ליעד ${en:.2f}."
+    telegram_sent, telegram_error = create_trade_alert(row, expected_net=en, risk_note=risk_msg)
+    alert_note = " | נשלחה התראה לטלגרם" if telegram_sent else " | נשמרה התראה בטבלת Alerts"
+    if telegram_error and "כבויות" not in telegram_error:
+        alert_note += f" | Telegram: {telegram_error}"
+
+    return True, f"{ticker}: נפתחה {side} | {mode} | ניקוד {score} | יוניטים {unit_mult} | {risk_msg} | נטו צפוי ליעד ${en:.2f}.{alert_note}"
 
 
 def update_trade_stop(trade_id, new_stop):
@@ -1657,6 +2174,13 @@ def manage_trade(row, df_after_entry):
 
 
 def close_trade_at_index(trades, idx, current, reason):
+    trades = normalize_trade_dtypes(trades)
+
+    # Make sure time/text columns can receive strings.
+    for _col in ["exit_time", "status", "exit_reason", "exit_reason_he", "management_action", "management_reason"]:
+        if _col in trades.columns:
+            trades[_col] = trades[_col].astype("object")
+
     pnl = pnl_for_trade(trades.loc[idx], current)
     for k, v in pnl.items():
         trades.loc[idx, k] = v
@@ -1678,7 +2202,7 @@ def current_total_net(trades):
     return float(pd.to_numeric(trades["net_pnl"], errors="coerce").fillna(0).sum())
 
 def check_cycle_target_and_close():
-    trades = load_trades()
+    trades = normalize_trade_dtypes(load_trades())
     messages = []
     if trades.empty:
         return trades, messages
@@ -1720,7 +2244,7 @@ def check_cycle_target_and_close():
     return trades, messages
 
 def update_open_trades():
-    trades = load_trades()
+    trades = normalize_trade_dtypes(load_trades())
     messages = []
     if trades.empty:
         return trades, messages
@@ -1811,6 +2335,9 @@ def scan_and_open(tickers, modes, min_score, max_new_override=None, max_open_ove
     candidates = []
 
     for ticker in tickers:
+        ticker = normalize_ticker(ticker)
+        if is_blocked_ticker(ticker):
+            continue
         for mode in modes:
             try:
                 sig = make_signal(ticker, mode)
@@ -1878,6 +2405,189 @@ def summary_stats(trades):
         "cost_total": float(trades["total_cost"].sum()),
         "net_total": float(trades["net_pnl"].sum()),
     }
+
+def fmt_order_qty(qty):
+    q = safe_float(qty, np.nan)
+    if np.isnan(q) or q <= 0:
+        return ""
+    if abs(q - round(q)) < 1e-6:
+        return str(int(round(q)))
+    return f"{q:.4f}".rstrip("0").rstrip(".")
+
+
+def fmt_order_price(x):
+    v = safe_float(x, np.nan)
+    if np.isnan(v):
+        return ""
+    return f"{v:.2f}"
+
+
+def order_ticket_values(row):
+    ticker = str(row.get("ticker", "")).upper()
+    side = str(row.get("side", "")).upper()
+    stop = fmt_order_price(row.get("stop_loss"))
+    target = fmt_order_price(row.get("target_reference"))
+    qty = fmt_order_qty(row.get("quantity"))
+    entry = fmt_order_price(row.get("entry_price"))
+
+    full_ticket = (
+        f"Ticker: {ticker}\n"
+        f"Side: {side}\n"
+        f"Entry: {entry}\n"
+        f"Stop Loss: {stop}\n"
+        f"Take Profit: {target}\n"
+        f"Quantity: {qty}"
+    )
+
+    return {
+        "ticker": ticker,
+        "side": side,
+        "entry": entry,
+        "stop": stop,
+        "target": target,
+        "qty": qty,
+        "full_ticket": full_ticket,
+    }
+
+
+def copy_button_component(label, value, button_key):
+    """
+    Clipboard button rendered with a small HTML component.
+    Works best on localhost/HTTPS because browsers restrict clipboard access.
+    """
+    value_json = json.dumps(str(value))
+    label_html = html.escape(str(label))
+    button_id = f"copy_btn_{button_key}"
+    status_id = f"copy_status_{button_key}"
+
+    components.html(
+        f"""
+        <div style="direction:ltr;text-align:left;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;">
+          <button id="{button_id}" onclick='copyValue_{button_key}()'
+            style="
+              width:100%;
+              border:1px solid #d1d5db;
+              border-radius:10px;
+              padding:9px 10px;
+              background:#f9fafb;
+              color:#111827;
+              cursor:pointer;
+              font-weight:600;
+            ">
+            {label_html}
+          </button>
+          <div id="{status_id}" style="font-size:11px;color:#16a34a;height:16px;margin-top:3px;"></div>
+        </div>
+        <script>
+          function fallbackCopy_{button_key}(text) {{
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            ta.style.position = 'fixed';
+            ta.style.left = '-9999px';
+            document.body.appendChild(ta);
+            ta.focus();
+            ta.select();
+            try {{
+              document.execCommand('copy');
+              document.getElementById('{status_id}').innerText = 'Copied';
+            }} catch (err) {{
+              document.getElementById('{status_id}').innerText = 'Copy failed';
+            }}
+            document.body.removeChild(ta);
+          }}
+
+          function copyValue_{button_key}() {{
+            const text = {value_json};
+            if (navigator.clipboard && window.isSecureContext) {{
+              navigator.clipboard.writeText(text).then(function() {{
+                document.getElementById('{status_id}').innerText = 'Copied';
+              }}).catch(function() {{
+                fallbackCopy_{button_key}(text);
+              }});
+            }} else {{
+              fallbackCopy_{button_key}(text);
+            }}
+          }}
+        </script>
+        """,
+        height=62,
+    )
+
+
+def render_order_ticket_card(row, card_idx):
+    vals = order_ticket_values(row)
+
+    side = vals["side"]
+    direction = "🟢 LONG 📈" if side == "LONG" else "🔴 SHORT 📉" if side == "SHORT" else "⚪ SIGNAL"
+
+    st.markdown(
+        f"""
+        <div style="
+            direction:ltr;
+            text-align:left;
+            border:1px solid #e5e7eb;
+            border-radius:18px;
+            padding:16px;
+            background:#ffffff;
+            box-shadow:0 6px 14px rgba(0,0,0,.05);
+            margin:10px 0;
+            font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;
+        ">
+            <div style="font-size:20px;font-weight:800;margin-bottom:8px;">{html.escape(direction)}</div>
+            <div style="font-size:17px;line-height:1.7;">
+                <strong>Ticker:</strong> {html.escape(vals["ticker"])}<br>
+                <strong>Side:</strong> {html.escape(vals["side"])}<br>
+                <strong>Stop Loss:</strong> {html.escape(vals["stop"])}<br>
+                <strong>Take Profit:</strong> {html.escape(vals["target"])}<br>
+                <strong>Quantity:</strong> {html.escape(vals["qty"])}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1:
+        copy_button_component("Copy Ticker", vals["ticker"], f"{card_idx}_ticker")
+    with c2:
+        copy_button_component("Copy Stop Loss", vals["stop"], f"{card_idx}_stop")
+    with c3:
+        copy_button_component("Copy Take Profit", vals["target"], f"{card_idx}_target")
+    with c4:
+        copy_button_component("Copy Quantity", vals["qty"], f"{card_idx}_qty")
+    with c5:
+        copy_button_component("Copy Full Ticket", vals["full_ticket"], f"{card_idx}_full")
+
+
+def render_order_ticket_helper():
+    st.markdown("### 🧾 Order Ticket Helper")
+    st.markdown(
+        "<div class='card warn'><strong>Manual only:</strong> Copy the values into TradingView yourself. "
+        "This app does not send real orders and does not click Buy/Sell automatically.</div>",
+        unsafe_allow_html=True,
+    )
+
+    trades = load_trades()
+    if trades.empty:
+        st.info("No trades yet.")
+        return
+
+    open_trades = trades[trades["status"].astype(str).eq("OPEN")].copy()
+    if open_trades.empty:
+        st.info("No open Paper trades right now.")
+        st.markdown("#### Recent tickets")
+        recent = trades.sort_values("entry_time", ascending=False).head(10).copy()
+        if recent.empty:
+            return
+        for i, (_, row) in enumerate(recent.iterrows()):
+            render_order_ticket_card(row, f"recent_{i}")
+        return
+
+    st.markdown("#### Open Paper trades")
+    open_trades = open_trades.sort_values("entry_time", ascending=False)
+    for i, (_, row) in enumerate(open_trades.iterrows()):
+        render_order_ticket_card(row, f"open_{i}")
+
 
 def render_summary(trades):
     stats = summary_stats(trades)
@@ -2026,6 +2736,10 @@ def render_closed_trades(closed_trades):
 # ============================================================
 
 def make_signal_from_history(ticker, mode, hist_df):
+    ticker = normalize_ticker(ticker)
+    if is_blocked_ticker(ticker):
+        return {"signal": "WAIT", "ticker": ticker, "mode": mode, "score": 0, "reason": "Blocked ticker from avoid list."}
+
     """
     Same signal logic, but using only candles available up to the current replay minute.
     This prevents look-ahead bias in the backtest.
@@ -2066,6 +2780,30 @@ def make_signal_from_history(ticker, mode, hist_df):
     hist_adj = historical_pattern_adjustment(ticker, mode, side, d, current_time=d.index[-1])
     score = int(max(1, min(8, int(score) + int(hist_adj.get("delta", 0)))))
 
+    time_ok, time_msg = after_30_min_quality_filter(side, score, hist_adj, d.index[-1])
+    if not time_ok:
+        return {
+            "signal": "WAIT",
+            "ticker": normalize_ticker(ticker),
+            "mode": mode,
+            "score": int(score),
+            "reason": time_msg,
+        }
+
+    extra_reasons = [chart_plan.get("reason", ""), hist_adj.get("reason", ""), time_msg]
+
+    if side == "SHORT":
+        short_ok, short_msg = strict_short_quality_filter(d, mode, score, use_market_filter=False)
+        if not short_ok:
+            return {
+                "signal": "WAIT",
+                "ticker": normalize_ticker(ticker),
+                "mode": mode,
+                "score": int(score),
+                "reason": short_msg,
+            }
+        extra_reasons.append(short_msg)
+
     return {
         "signal": side,
         "ticker": normalize_ticker(ticker),
@@ -2074,7 +2812,7 @@ def make_signal_from_history(ticker, mode, hist_df):
         "entry": float(entry),
         "stop": float(stop),
         "target": float(target),
-        "reason": " | ".join(reasons + [chart_plan.get("reason", ""), hist_adj.get("reason", "")]),
+        "reason": " | ".join(reasons + extra_reasons),
     }
 
 
@@ -2661,22 +3399,34 @@ def render_backtest_trades_table(trades_df):
 # Main UI
 # ============================================================
 
+# One-time lightweight migration: rewrite old trades CSV with safe dtypes if it exists,
+# and rewrite tickers so the avoid-list tickers disappear from older saved settings.
+try:
+    if TRADES_FILE.exists() and TRADES_FILE.stat().st_size > 0:
+        _tmp_trades = load_trades()
+        save_trades(_tmp_trades)
+    save_tickers(load_tickers())
+except Exception:
+    pass
+
 st.markdown(
     """
 <div class="title-box">
-<h1>🧪 Paper Trading Lab V5.7</h1>
+<h1>🧪 Paper Trading Lab V6.4</h1>
 <p>אפליקציית Paper Trading נקייה: יעד מחזור 50$, סטופ ידני, סיבות יציאה, Break-even אחרי עלויות וצמצום הפסדים.</p>
 </div>
 """,
     unsafe_allow_html=True,
 )
 
-tab_paper, tab_costs, tab_units, tab_rules, tab_account, tab_backtest, tab_help = st.tabs([
+tab_paper, tab_ticket, tab_costs, tab_units, tab_rules, tab_account, tab_alerts, tab_backtest, tab_help = st.tabs([
     "🧪 Paper Trading",
+    "🧾 Order Ticket Helper",
     "💸 עלויות",
     "📦 יוניטים לפי ניקוד",
     "⚙️ חוקים חכמים",
     "🏦 חשבון ומחזורים",
+    "🔔 Alerts",
     "📊 Backtest יום מסחר",
     "📘 הסבר",
 ])
@@ -2684,6 +3434,7 @@ tab_paper, tab_costs, tab_units, tab_rules, tab_account, tab_backtest, tab_help 
 
 with tab_paper:
     st.markdown("<div class='card warn'><strong>בדמו בלבד:</strong> אין חיבור לברוקר ואין כסף אמיתי.</div>", unsafe_allow_html=True)
+    st.caption("Avoid list פעילה: " + ", ".join(BLOCKED_TICKERS))
 
     trades, update_msgs = update_open_trades()
     pending_msgs = process_pending_signals(min_score=4)
@@ -2705,10 +3456,13 @@ with tab_paper:
         if st.button("➕ הוסף מניה", use_container_width=True):
             t = normalize_ticker(new_ticker)
             if t:
-                tickers.append(t)
-                save_tickers(tickers)
-                st.success(f"{t} נוסף.")
-                st.rerun()
+                if is_blocked_ticker(t):
+                    st.warning(f"{t} חסומה לפי רשימת Avoid ולא תתווסף.")
+                else:
+                    tickers.append(t)
+                    save_tickers(tickers)
+                    st.success(f"{t} נוסף.")
+                    st.rerun()
 
     with b:
         modes = st.multiselect("סוג השקעה", ["מהירה", "חצי שעה"], default=["מהירה", "חצי שעה"])
@@ -2778,6 +3532,10 @@ with tab_paper:
     if auto_run:
         time.sleep(30)
         st.rerun()
+
+
+with tab_ticket:
+    render_order_ticket_helper()
 
 
 with tab_costs:
@@ -2949,6 +3707,147 @@ with tab_account:
             account["last_cycle_reason"] = ""
             save_account(account)
             st.success("המחזורים אופסו, העסקאות לא נמחקו.")
+
+
+with tab_alerts:
+    st.subheader("🔔 Alerts לטלגרם ול־TradingView")
+
+    st.markdown(
+        """
+<div class="card warn">
+<strong>בדמו בלבד:</strong> ההתראה רק מודיעה על עסקת Paper שאושרה. אין ביצוע אוטומטי ואין כסף אמיתי.
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+    settings = load_alert_settings()
+
+    a1, a2 = st.columns(2)
+
+    with a1:
+        alerts_enabled = st.checkbox(
+            "הפעל מערכת Alerts",
+            value=bool(settings.get("alerts_enabled", False)),
+            key="alerts_enabled",
+        )
+        telegram_enabled = st.checkbox(
+            "שלח גם לטלגרם",
+            value=bool(settings.get("telegram_enabled", False)),
+            key="telegram_enabled",
+        )
+        send_score = st.slider(
+            "שלח לטלגרם רק מניקוד",
+            1,
+            8,
+            int(settings.get("send_only_score_at_least", 8)),
+            key="send_only_score",
+        )
+        include_reason = st.checkbox(
+            "Include reasons in message — currently ignored, message is minimal",
+            value=bool(settings.get("include_reason", True)),
+            key="include_reason",
+        )
+
+    with a2:
+        bot_token = st.text_input(
+            "Telegram Bot Token",
+            value=str(settings.get("telegram_bot_token", "")),
+            type="password",
+            key="telegram_bot_token",
+        )
+        chat_id = st.text_input(
+            "Telegram Chat ID",
+            value=str(settings.get("telegram_chat_id", "")),
+            key="telegram_chat_id",
+        )
+
+        st.caption("ה־Token נשמר בקובץ מקומי בתוך paper_data. אל תעלה אותו לגיטהאב ציבורי.")
+
+    b1, b2, b3 = st.columns(3)
+
+    with b1:
+        if st.button("💾 שמור הגדרות Alerts", use_container_width=True, key="save_alert_settings"):
+            save_alert_settings(
+                {
+                    "alerts_enabled": bool(alerts_enabled),
+                    "telegram_enabled": bool(telegram_enabled),
+                    "telegram_bot_token": str(bot_token).strip(),
+                    "telegram_chat_id": str(chat_id).strip(),
+                    "send_only_score_at_least": int(send_score),
+                    "include_reason": bool(include_reason),
+                }
+            )
+            st.success("הגדרות Alerts נשמרו.")
+
+    with b2:
+        if st.button("📨 שלח התראת ניסיון", use_container_width=True, key="send_test_alert"):
+            save_alert_settings(
+                {
+                    "alerts_enabled": bool(alerts_enabled),
+                    "telegram_enabled": bool(telegram_enabled),
+                    "telegram_bot_token": str(bot_token).strip(),
+                    "telegram_chat_id": str(chat_id).strip(),
+                    "send_only_score_at_least": int(send_score),
+                    "include_reason": bool(include_reason),
+                }
+            )
+            ok, err = send_test_telegram_alert()
+            if ok:
+                st.success("התראת ניסיון נשלחה לטלגרם.")
+            else:
+                st.error(f"שליחת ניסיון נכשלה: {err}")
+
+    with b3:
+        if st.button("🧹 נקה טבלת Alerts", use_container_width=True, key="clear_alerts"):
+            clear_alerts()
+            st.success("טבלת Alerts נוקתה.")
+            st.rerun()
+
+    st.markdown("### איך מחברים לטלגרם?")
+    st.markdown(
+        """
+1. בטלגרם חפש `@BotFather`.
+2. צור בוט חדש עם `/newbot`.
+3. קבל ממנו `Bot Token`.
+4. שלח הודעה אחת לבוט שלך מתוך הטלגרם.
+5. הכנס כאן את ה־Bot Token ואת ה־Chat ID.
+6. לחץ `שלח התראת ניסיון`.
+"""
+    )
+
+    st.markdown("### Alerts שנוצרו")
+    alerts = load_alerts()
+
+    if alerts.empty:
+        st.info("אין Alerts עדיין. כשעסקת Paper תיפתח אחרי אישור הדקה, היא תופיע כאן.")
+    else:
+        display = alerts.sort_values("created_at", ascending=False).copy()
+        display["TradingView"] = display["tradingview_url"].apply(lambda x: str(x))
+        show = pd.DataFrame(
+            {
+                "זמן": display["created_at"].astype(str).str.slice(0, 19),
+                "מניה": display["ticker"],
+                "סוג": display["mode"],
+                "כיוון": display["side"],
+                "ניקוד": pd.to_numeric(display["score"], errors="coerce").fillna(0).astype(int),
+                "כניסה": display["entry_price"].map(fmt_price),
+                "סטופ": display["stop_loss"].map(fmt_price),
+                "TP": display["target_reference"].map(fmt_price),
+                "טלגרם נשלח": display["telegram_sent"],
+                "שגיאת Telegram": display["telegram_error"],
+                "TradingView": display["TradingView"],
+            }
+        )
+        st.dataframe(show, use_container_width=True, hide_index=True)
+
+        with st.expander("הודעות מלאות שנשלחו/נשמרו"):
+            for _, r in display.head(20).iterrows():
+                st.markdown(f"**{r['ticker']} | {r['side']} | {str(r['created_at'])[:19]}**")
+                st.code(str(r.get("message", "")), language="text")
+                st.write("TradingView:", str(r.get("tradingview_url", "")))
+                st.markdown("---")
+
 
 
 with tab_backtest:
@@ -3142,7 +4041,7 @@ with tab_help:
 - ווליום
 - מבנה נרות
 
-### מה נוסף ב־V5.7?
+### What changed in V6.4?
 
 **זמן יציאה ומשך עסקה**  
 בכל עסקה סגורה מופיע זמן יציאה וגם משך העסקה בדקות.

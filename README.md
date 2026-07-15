@@ -1,3 +1,3 @@
-# Paper Trading Lab V5.7
+# Paper Trading Lab V6.4
 
-Adds a historical intraday pattern filter after 30 minutes from market open. Paper trading only. Educational/demo only, not investment advice.
+Adds avoid-list filtering for ADBE, MSFT, BABA, COIN, SMCI, UBER, and LLY. Adds stricter SHORT filtering and after-30-minute quality filter. Paper trading only.
