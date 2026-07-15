@@ -22,7 +22,7 @@ import plotly.graph_objects as go
 # App setup
 # ============================================================
 
-st.set_page_config(page_title="Paper Trading Lab V6.5", page_icon="🧪", layout="wide")
+st.set_page_config(page_title="Paper Trading Lab V6.4 REALTIME REPLAY", page_icon="🧪", layout="wide")
 
 DATA_DIR = Path("paper_data")
 DATA_DIR.mkdir(exist_ok=True)
@@ -39,18 +39,13 @@ ALERT_SETTINGS_FILE = DATA_DIR / "alert_settings_v5_8.json"
 
 NY_TZ = "America/New_York"
 
-BLOCKED_TICKERS = [
-    # Removed after the 2026-07-13 paper-trade report because they damaged performance.
-    "ADBE", "MSFT", "BABA", "COIN", "SMCI", "UBER", "LLY",
-]
-
 DEFAULT_TICKERS = [
     "QQQ", "SPY", "IWM", "DIA", "TQQQ", "SQQQ",
-    "AAPL", "NVDA", "AMD", "AVGO", "ARM", "INTC", "MU", "MRVL",
+    "AAPL", "MSFT", "NVDA", "AMD", "AVGO", "ARM", "INTC", "MU", "MRVL", "SMCI",
     "TSLA", "META", "GOOGL", "AMZN", "NFLX",
-    "PLTR", "MSTR", "HOOD", "SOFI", "SHOP", "SNOW",
-    "CRM", "ORCL", "PANW", "CRWD",
-    "JPM", "BAC", "XOM", "CVX", "UNH",
+    "PLTR", "MSTR", "COIN", "HOOD", "SOFI", "UBER", "SHOP", "SNOW",
+    "CRM", "ORCL", "ADBE", "PANW", "CRWD", "BABA",
+    "JPM", "BAC", "XOM", "CVX", "LLY", "UNH",
 ]
 
 DEFAULT_COSTS = {
@@ -89,11 +84,6 @@ DEFAULT_RULES = {
     "min_net_profit_for_giveback": 5.0,
     "confirm_before_entry_seconds": 60,
     "pending_signal_expire_minutes": 6,
-
-    # Direction-quality filters
-    "no_entry_first_minutes": 15,
-    "required_side_score_gap": 2,
-
     "use_history_after_minutes": 30,
     "history_min_samples": 2,
     "history_max_score_bonus": 2,
@@ -222,19 +212,6 @@ def normalize_ticker(t):
         t = t.split(":")[-1]
     return t.replace(" ", "")
 
-
-def is_blocked_ticker(ticker):
-    return normalize_ticker(ticker) in set(BLOCKED_TICKERS)
-
-
-def filter_allowed_tickers(tickers):
-    out = []
-    for t in tickers or []:
-        nt = normalize_ticker(t)
-        if nt and not is_blocked_ticker(nt):
-            out.append(nt)
-    return sorted(set(out))
-
 def read_json(path, default):
     if not path.exists() or path.stat().st_size == 0:
         return default
@@ -257,13 +234,13 @@ def write_json(path, data):
 
 def load_tickers():
     data = read_json(TICKERS_FILE, {"tickers": DEFAULT_TICKERS})
-    tickers = filter_allowed_tickers(data.get("tickers", DEFAULT_TICKERS))
+    tickers = sorted(set(normalize_ticker(x) for x in data.get("tickers", DEFAULT_TICKERS) if normalize_ticker(x)))
     if len(tickers) < 20:
-        tickers = filter_allowed_tickers(tickers + DEFAULT_TICKERS)
+        tickers = sorted(set(tickers + DEFAULT_TICKERS))
     return tickers
 
 def save_tickers(tickers):
-    write_json(TICKERS_FILE, {"tickers": filter_allowed_tickers(tickers)})
+    write_json(TICKERS_FILE, {"tickers": sorted(set(normalize_ticker(x) for x in tickers if normalize_ticker(x)))})
 
 def load_costs():
     return read_json(COSTS_FILE, DEFAULT_COSTS)
@@ -1398,239 +1375,6 @@ def historical_pattern_adjustment(ticker, mode, side, current_session_df, curren
     return {"delta": int(delta), "reason": reason}
 
 
-
-# ============================================================
-# Conservative quality filters from the trade report
-# ============================================================
-
-def market_allows_short_live(mode):
-    """
-    Conservative live-only market filter for shorts.
-    For live scans, short is allowed only if the broad market also looks weak.
-    In backtest we avoid using live QQQ data to prevent look-ahead bias.
-    """
-    try:
-        q = latest_session(fetch_1m("QQQ"))
-        if q is None or q.empty:
-            return False, "Short blocked: QQQ data unavailable."
-
-        q = add_indicators(q).dropna(subset=["close"])
-        if q.empty:
-            return False, "Short blocked: QQQ indicators unavailable."
-
-        last = q.iloc[-1]
-        close = safe_float(last["close"])
-
-        if str(mode) == "מהירה":
-            ok = (
-                close < safe_float(last["vwap"])
-                and close < safe_float(last["ema9"])
-                and safe_float(last["ema3"]) < safe_float(last["ema5"])
-                and safe_float(last["ema3_slope"], 0) < 0
-                and safe_float(last["ema5_slope"], 0) < 0
-            )
-        else:
-            ok = (
-                close < safe_float(last["vwap"])
-                and close < safe_float(last["ema50"])
-                and safe_float(last["ema9"]) < safe_float(last["ema21"])
-                and safe_float(last["ema9_slope"], 0) < 0
-                and safe_float(last["ema21_slope"], 0) < 0
-            )
-
-        if ok:
-            return True, "Market filter: QQQ also bearish."
-        return False, "Short blocked: QQQ is not bearish enough."
-    except Exception as e:
-        return False, f"Short blocked: market filter error {str(e)[:80]}"
-
-
-def market_allows_long_live(mode):
-    """
-    Conservative live-only market filter for longs.
-    If QQQ is bearish or under VWAP/EMA structure, a LONG is blocked.
-    """
-    try:
-        q = latest_session(fetch_1m("QQQ"))
-        if q is None or q.empty:
-            return False, "Long blocked: QQQ data unavailable."
-
-        q = add_indicators(q).dropna(subset=["close"])
-        if q.empty:
-            return False, "Long blocked: QQQ indicators unavailable."
-
-        last = q.iloc[-1]
-        close = safe_float(last["close"])
-
-        if str(mode) == "מהירה":
-            ok = (
-                close > safe_float(last["vwap"])
-                and close > safe_float(last["ema9"])
-                and safe_float(last["ema3"]) > safe_float(last["ema5"])
-                and safe_float(last["ema3_slope"], 0) > 0
-                and safe_float(last["ema5_slope"], 0) > 0
-            )
-        else:
-            ok = (
-                close > safe_float(last["vwap"])
-                and close > safe_float(last["ema50"])
-                and safe_float(last["ema9"]) > safe_float(last["ema21"])
-                and safe_float(last["ema9_slope"], 0) > 0
-                and safe_float(last["ema21_slope"], 0) > 0
-            )
-
-        if ok:
-            return True, "Market filter: QQQ also bullish."
-        return False, "Long blocked: QQQ is not bullish enough."
-    except Exception as e:
-        return False, f"Long blocked: market filter error {str(e)[:80]}"
-
-
-def entry_time_gate(current_time):
-    """
-    Blocks new entries during the first minutes after the NY open.
-    This prevents fake early LONG/SHORT signals from the opening noise.
-    """
-    rules = load_rules()
-    block_minutes = float(rules.get("no_entry_first_minutes", 15))
-    elapsed = session_minutes_from_open(current_time)
-    if elapsed < block_minutes:
-        return False, f"Entry blocked: only {elapsed:.0f} minutes from open. Required {block_minutes:.0f}."
-    return True, f"Entry time gate passed: {elapsed:.0f} minutes from open."
-
-
-def choose_direction_with_gap(ls, ss):
-    """
-    Do not choose LONG just because it tied SHORT.
-    The chosen side must beat the opposite side by a clear gap.
-    """
-    rules = load_rules()
-    gap = int(rules.get("required_side_score_gap", 2))
-
-    if int(ls) >= 3 and int(ls) >= int(ss) + gap:
-        return "LONG", int(ls), f"Direction OK: LONG score {int(ls)} vs SHORT score {int(ss)}, gap {gap}."
-    if int(ss) >= 3 and int(ss) >= int(ls) + gap:
-        return "SHORT", int(ss), f"Direction OK: SHORT score {int(ss)} vs LONG score {int(ls)}, gap {gap}."
-
-    return "WAIT", max(int(ls), int(ss)), f"Direction blocked: LONG {int(ls)} vs SHORT {int(ss)} — no clear gap."
-
-
-def strict_long_quality_filter(d, mode, score, use_market_filter=True):
-    """
-    Prevent false LONG entries that are actually bearish setups.
-    LONG requires:
-    - final score 8
-    - clean bullish structure on the ticker
-    - in live scans, QQQ must also be bullish
-    """
-    if d is None or d.empty:
-        return False, "Long blocked: no data."
-
-    last = d.iloc[-1]
-    close = safe_float(last["close"])
-
-    if int(score) < 8:
-        return False, f"Long blocked: score {int(score)} is below required 8."
-
-    if str(mode) == "מהירה":
-        ticker_ok = (
-            close > safe_float(last["vwap"])
-            and close > safe_float(last["ema9"])
-            and safe_float(last["ema3"]) > safe_float(last["ema5"])
-            and safe_float(last["ema3_slope"], 0) > 0
-            and safe_float(last["ema5_slope"], 0) > 0
-            and safe_float(last["mom2_pct"], 0) > 0.03
-        )
-    else:
-        ticker_ok = (
-            close > safe_float(last["vwap"])
-            and close > safe_float(last["ema50"])
-            and safe_float(last["ema9"]) > safe_float(last["ema21"])
-            and safe_float(last["ema9_slope"], 0) > 0
-            and safe_float(last["ema21_slope"], 0) > 0
-            and safe_float(last["mom30_pct"], 0) > 0.05
-        )
-
-    if not ticker_ok:
-        return False, "Long blocked: ticker bullish structure is not strong enough."
-
-    if use_market_filter:
-        market_ok, market_msg = market_allows_long_live(mode)
-        if not market_ok:
-            return False, market_msg
-        return True, "Strict long filter passed. " + market_msg
-
-    return True, "Strict long filter passed."
-
-
-def strict_short_quality_filter(d, mode, score, use_market_filter=True):
-    """
-    Based on the latest paper report, shorts were the weak side.
-    So shorts require:
-    - final score 8
-    - clean bearish structure on the traded ticker
-    - in live scans, QQQ must also be bearish
-    """
-    if d is None or d.empty:
-        return False, "Short blocked: no data."
-
-    last = d.iloc[-1]
-    close = safe_float(last["close"])
-
-    if int(score) < 8:
-        return False, f"Short blocked: score {int(score)} is below required 8."
-
-    if str(mode) == "מהירה":
-        ticker_ok = (
-            close < safe_float(last["vwap"])
-            and close < safe_float(last["ema9"])
-            and safe_float(last["ema3"]) < safe_float(last["ema5"])
-            and safe_float(last["ema3_slope"], 0) < 0
-            and safe_float(last["ema5_slope"], 0) < 0
-            and safe_float(last["mom2_pct"], 0) < -0.03
-        )
-    else:
-        ticker_ok = (
-            close < safe_float(last["vwap"])
-            and close < safe_float(last["ema50"])
-            and safe_float(last["ema9"]) < safe_float(last["ema21"])
-            and safe_float(last["ema9_slope"], 0) < 0
-            and safe_float(last["ema21_slope"], 0) < 0
-            and safe_float(last["mom30_pct"], 0) < -0.05
-        )
-
-    if not ticker_ok:
-        return False, "Short blocked: ticker bearish structure is not strong enough."
-
-    if use_market_filter:
-        market_ok, market_msg = market_allows_short_live(mode)
-        if not market_ok:
-            return False, market_msg
-        return True, "Strict short filter passed. " + market_msg
-
-    return True, "Strict short filter passed."
-
-
-def after_30_min_quality_filter(side, score, hist_adj, current_time):
-    """
-    After 30 minutes from market open we only allow very clean setups:
-    - score must be 8
-    - historical adjustment must not be negative
-    """
-    elapsed = session_minutes_from_open(current_time)
-    if elapsed < 30:
-        return True, f"Time filter not active yet: {elapsed:.0f} minutes from open."
-
-    delta = int(hist_adj.get("delta", 0))
-    if int(score) < 8:
-        return False, f"After-30 filter blocked: score {int(score)} below 8."
-
-    if delta < 0:
-        return False, f"After-30 filter blocked: history delta {delta:+d} is negative."
-
-    return True, f"After-30 filter passed: elapsed {elapsed:.0f} minutes, history delta {delta:+d}."
-
-
 # ============================================================
 # Signal logic
 # ============================================================
@@ -1722,10 +1466,6 @@ def score_side_half(d, side):
     return int(max(1, min(8, score))), reasons
 
 def make_signal(ticker, mode):
-    ticker = normalize_ticker(ticker)
-    if is_blocked_ticker(ticker):
-        return {"signal": "WAIT", "ticker": ticker, "mode": mode, "score": 0, "reason": "Blocked ticker from avoid list."}
-
     df = latest_session(fetch_1m(ticker))
     if df.empty:
         return {"signal": "WAIT", "ticker": ticker, "mode": mode, "score": 0, "reason": "אין נתונים"}
@@ -1748,17 +1488,12 @@ def make_signal(ticker, mode):
     entry = safe_float(d.iloc[-1]["close"])
     atr = max(atr, entry * 0.0008)
 
-    gate_ok, gate_msg = entry_time_gate(d.index[-1])
-    if not gate_ok:
-        return {"signal": "WAIT", "ticker": ticker, "mode": mode, "score": max(ls, ss), "reason": gate_msg}
-
-    side, score, gap_msg = choose_direction_with_gap(ls, ss)
-    if side == "LONG":
-        reasons = lr + [gap_msg]
-    elif side == "SHORT":
-        reasons = sr + [gap_msg]
+    if ls >= ss and ls >= 3:
+        side, score, reasons = "LONG", ls, lr
+    elif ss > ls and ss >= 3:
+        side, score, reasons = "SHORT", ss, sr
     else:
-        return {"signal": "WAIT", "ticker": ticker, "mode": mode, "score": score, "reason": gap_msg}
+        return {"signal": "WAIT", "ticker": ticker, "mode": mode, "score": max(ls, ss), "reason": f"לונג {ls}, שורט {ss} — אין יתרון ברור"}
 
     chart_plan = chart_based_stop_target(d, side, mode)
     stop = chart_plan["stop"]
@@ -1766,42 +1501,6 @@ def make_signal(ticker, mode):
 
     hist_adj = historical_pattern_adjustment(ticker, mode, side, d)
     score = int(max(1, min(8, int(score) + int(hist_adj.get("delta", 0)))))
-
-    time_ok, time_msg = after_30_min_quality_filter(side, score, hist_adj, d.index[-1])
-    if not time_ok:
-        return {
-            "signal": "WAIT",
-            "ticker": normalize_ticker(ticker),
-            "mode": mode,
-            "score": int(score),
-            "reason": time_msg,
-        }
-
-    extra_reasons = [chart_plan["reason"], hist_adj.get("reason", ""), time_msg]
-
-    if side == "LONG":
-        long_ok, long_msg = strict_long_quality_filter(d, mode, score, use_market_filter=True)
-        if not long_ok:
-            return {
-                "signal": "WAIT",
-                "ticker": normalize_ticker(ticker),
-                "mode": mode,
-                "score": int(score),
-                "reason": long_msg,
-            }
-        extra_reasons.append(long_msg)
-
-    if side == "SHORT":
-        short_ok, short_msg = strict_short_quality_filter(d, mode, score, use_market_filter=True)
-        if not short_ok:
-            return {
-                "signal": "WAIT",
-                "ticker": normalize_ticker(ticker),
-                "mode": mode,
-                "score": int(score),
-                "reason": short_msg,
-            }
-        extra_reasons.append(short_msg)
 
     return {
         "signal": side,
@@ -1811,7 +1510,7 @@ def make_signal(ticker, mode):
         "entry": float(entry),
         "stop": float(stop),
         "target": float(target),
-        "reason": " | ".join(reasons + extra_reasons),
+        "reason": " | ".join(reasons + [chart_plan["reason"], hist_adj.get("reason", "")]),
     }
 
 
@@ -2475,9 +2174,6 @@ def scan_and_open(tickers, modes, min_score, max_new_override=None, max_open_ove
     candidates = []
 
     for ticker in tickers:
-        ticker = normalize_ticker(ticker)
-        if is_blocked_ticker(ticker):
-            continue
         for mode in modes:
             try:
                 sig = make_signal(ticker, mode)
@@ -2876,10 +2572,6 @@ def render_closed_trades(closed_trades):
 # ============================================================
 
 def make_signal_from_history(ticker, mode, hist_df):
-    ticker = normalize_ticker(ticker)
-    if is_blocked_ticker(ticker):
-        return {"signal": "WAIT", "ticker": ticker, "mode": mode, "score": 0, "reason": "Blocked ticker from avoid list."}
-
     """
     Same signal logic, but using only candles available up to the current replay minute.
     This prevents look-ahead bias in the backtest.
@@ -2900,28 +2592,17 @@ def make_signal_from_history(ticker, mode, hist_df):
 
     entry = safe_float(d.iloc[-1]["close"])
 
-    gate_ok, gate_msg = entry_time_gate(d.index[-1])
-    if not gate_ok:
-        return {
-            "signal": "WAIT",
-            "ticker": normalize_ticker(ticker),
-            "mode": mode,
-            "score": max(ls, ss),
-            "reason": gate_msg,
-        }
-
-    side, score, gap_msg = choose_direction_with_gap(ls, ss)
-    if side == "LONG":
-        reasons = lr + [gap_msg]
-    elif side == "SHORT":
-        reasons = sr + [gap_msg]
+    if ls >= ss and ls >= 3:
+        side, score, reasons = "LONG", ls, lr
+    elif ss > ls and ss >= 3:
+        side, score, reasons = "SHORT", ss, sr
     else:
         return {
             "signal": "WAIT",
             "ticker": normalize_ticker(ticker),
             "mode": mode,
-            "score": score,
-            "reason": gap_msg,
+            "score": max(ls, ss),
+            "reason": f"לונג {ls}, שורט {ss} — אין יתרון ברור",
         }
 
     chart_plan = chart_based_stop_target(d, side, mode)
@@ -2931,42 +2612,6 @@ def make_signal_from_history(ticker, mode, hist_df):
     hist_adj = historical_pattern_adjustment(ticker, mode, side, d, current_time=d.index[-1])
     score = int(max(1, min(8, int(score) + int(hist_adj.get("delta", 0)))))
 
-    time_ok, time_msg = after_30_min_quality_filter(side, score, hist_adj, d.index[-1])
-    if not time_ok:
-        return {
-            "signal": "WAIT",
-            "ticker": normalize_ticker(ticker),
-            "mode": mode,
-            "score": int(score),
-            "reason": time_msg,
-        }
-
-    extra_reasons = [chart_plan.get("reason", ""), hist_adj.get("reason", ""), time_msg]
-
-    if side == "LONG":
-        long_ok, long_msg = strict_long_quality_filter(d, mode, score, use_market_filter=False)
-        if not long_ok:
-            return {
-                "signal": "WAIT",
-                "ticker": normalize_ticker(ticker),
-                "mode": mode,
-                "score": int(score),
-                "reason": long_msg,
-            }
-        extra_reasons.append(long_msg)
-
-    if side == "SHORT":
-        short_ok, short_msg = strict_short_quality_filter(d, mode, score, use_market_filter=False)
-        if not short_ok:
-            return {
-                "signal": "WAIT",
-                "ticker": normalize_ticker(ticker),
-                "mode": mode,
-                "score": int(score),
-                "reason": short_msg,
-            }
-        extra_reasons.append(short_msg)
-
     return {
         "signal": side,
         "ticker": normalize_ticker(ticker),
@@ -2975,7 +2620,7 @@ def make_signal_from_history(ticker, mode, hist_df):
         "entry": float(entry),
         "stop": float(stop),
         "target": float(target),
-        "reason": " | ".join(reasons + extra_reasons),
+        "reason": " | ".join(reasons + [chart_plan.get("reason", ""), hist_adj.get("reason", "")]),
     }
 
 
@@ -3284,10 +2929,19 @@ def load_backtest_data_for_date(tickers_tuple, date_str):
     return data, missing
 
 
+
 def run_day_backtest(tickers, date_value, modes, min_score, max_open, max_trades_total):
     """
-    Replay a single historical day minute-by-minute.
-    This is a paper/backtest simulation only.
+    Real-time-like replay of a single historical trading day, minute by minute.
+
+    The replay imitates the live Paper Trading flow:
+    1. At each 1m candle, update existing open trades.
+    2. Check SL/TP/risk/giveback/management exits.
+    3. Process pending candidates that waited the configured confirmation delay.
+    4. Re-check the signal after the delay.
+    5. Open a Paper trade only if the delayed confirmation still passes.
+    6. Scan for new candidates using only candles available up to that minute.
+    7. Save a minute-by-minute state snapshot: open trades, pending, closed trades, equity.
     """
     costs = load_costs()
     units = load_units()
@@ -3303,9 +2957,10 @@ def run_day_backtest(tickers, date_value, modes, min_score, max_open, max_trades
             "equity": pd.DataFrame(),
             "messages": [f"לא נמצאו נתוני 1 דקה לתאריך {date_str}. ב־yfinance בדרך כלל צריך לבחור יום מהימים האחרונים."],
             "missing": missing,
+            "event_log": pd.DataFrame(),
+            "minute_state": pd.DataFrame(),
         }
 
-    # Build unified timeline
     all_times = sorted(set().union(*[set(df.index) for df in data.values()]))
     if not all_times:
         return {
@@ -3314,6 +2969,8 @@ def run_day_backtest(tickers, date_value, modes, min_score, max_open, max_trades
             "equity": pd.DataFrame(),
             "messages": ["לא נמצאו נרות למסחר."],
             "missing": missing,
+            "event_log": pd.DataFrame(),
+            "minute_state": pd.DataFrame(),
         }
 
     open_trades = []
@@ -3321,13 +2978,50 @@ def run_day_backtest(tickers, date_value, modes, min_score, max_open, max_trades
     pending = []
     messages = []
     equity_points = []
+    event_log = []
+    minute_state = []
     total_opened = 0
 
     confirm_seconds = float(rules.get("confirm_before_entry_seconds", 60))
     pending_expire_seconds = float(rules.get("pending_signal_expire_minutes", 6)) * 60
 
+    def log_event(time, event, ticker="", mode="", side="", score="", price="", reason="", net=""):
+        event_log.append(
+            {
+                "time": str(time),
+                "event": event,
+                "ticker": normalize_ticker(ticker),
+                "mode": str(mode),
+                "side": str(side),
+                "score": score,
+                "price": price,
+                "net_pnl": net,
+                "reason": str(reason),
+                "open_count": len(open_trades),
+                "pending_count": len(pending),
+                "closed_count": len(closed_trades),
+            }
+        )
+
+    def format_open_list():
+        parts = []
+        for t in open_trades:
+            parts.append(
+                f'{t.get("ticker","")} {t.get("side","")} '
+                f'entry={fmt_price(t.get("entry_price"))} '
+                f'now={fmt_price(t.get("current_price"))} '
+                f'net={fmt_money(t.get("net_pnl"))}'
+            )
+        return " | ".join(parts)
+
+    def format_pending_list():
+        parts = []
+        for p in pending:
+            parts.append(f'{p.get("ticker","")} {p.get("side","")} {p.get("mode","")} score={p.get("score","")}')
+        return " | ".join(parts)
+
     for current_time in all_times:
-        # Update open trades
+        # 1) Update currently open trades exactly like live management would do.
         updated_open = []
         for trade in open_trades:
             ticker = trade["ticker"]
@@ -3341,16 +3035,33 @@ def run_day_backtest(tickers, date_value, modes, min_score, max_open, max_trades
                 continue
 
             current_bar = hist.iloc[-1]
+            before_status = trade.get("status", "OPEN")
+            before_net = safe_float(trade.get("net_pnl"), 0)
+
             updated = backtest_update_trade(trade, hist, current_bar, current_time, rules)
 
             if updated["status"] == "CLOSED":
                 closed_trades.append(updated)
+                log_event(
+                    current_time,
+                    "CLOSED",
+                    ticker=updated.get("ticker", ""),
+                    mode=updated.get("mode", ""),
+                    side=updated.get("side", ""),
+                    score=updated.get("score", ""),
+                    price=fmt_price(updated.get("exit_price")),
+                    net=fmt_money(updated.get("net_pnl")),
+                    reason=updated.get("exit_reason_he", "") or updated.get("exit_reason", ""),
+                )
             else:
                 updated_open.append(updated)
+                if abs(safe_float(updated.get("net_pnl"), 0) - before_net) > 0.01:
+                    # Keep log light: not every tick, only meaningful updates are captured in minute_state.
+                    pass
 
         open_trades = updated_open
 
-        # Process pending candidates
+        # 2) Process pending candidates after the same confirmation delay used live.
         new_pending = []
         for p in pending:
             if p.get("status", "PENDING") != "PENDING":
@@ -3361,6 +3072,15 @@ def run_day_backtest(tickers, date_value, modes, min_score, max_open, max_trades
             mode = p["mode"]
 
             if age_seconds > pending_expire_seconds:
+                log_event(
+                    current_time,
+                    "PENDING_EXPIRED",
+                    ticker=ticker,
+                    mode=mode,
+                    side=p.get("side", ""),
+                    score=p.get("score", ""),
+                    reason="Pending signal expired before confirmation.",
+                )
                 continue
 
             if age_seconds < confirm_seconds:
@@ -3368,13 +3088,16 @@ def run_day_backtest(tickers, date_value, modes, min_score, max_open, max_trades
                 continue
 
             if total_opened >= int(max_trades_total):
+                log_event(current_time, "SKIP_MAX_TOTAL", ticker=ticker, mode=mode, reason="Max total trades reached.")
                 continue
 
             if len(open_trades) >= int(max_open):
                 new_pending.append(p)
+                log_event(current_time, "WAIT_MAX_OPEN", ticker=ticker, mode=mode, reason="Max open trades reached.")
                 continue
 
             if backtest_has_open_ticker(open_trades, ticker):
+                log_event(current_time, "SKIP_ALREADY_OPEN", ticker=ticker, mode=mode, reason="Ticker already open.")
                 continue
 
             hist = data.get(ticker, pd.DataFrame())
@@ -3383,6 +3106,8 @@ def run_day_backtest(tickers, date_value, modes, min_score, max_open, max_trades
                 new_pending.append(p)
                 continue
 
+            # This is the critical live-like step:
+            # re-run the signal one minute later, using only candles up to current_time.
             new_signal = make_signal_from_history(ticker, mode, hist)
             confirmed, confirm_msg = signal_confirmed_after_delay(
                 original_side=p["side"],
@@ -3392,6 +3117,15 @@ def run_day_backtest(tickers, date_value, modes, min_score, max_open, max_trades
             )
 
             if not confirmed:
+                log_event(
+                    current_time,
+                    "PENDING_REJECTED",
+                    ticker=ticker,
+                    mode=mode,
+                    side=p.get("side", ""),
+                    score=p.get("score", ""),
+                    reason=confirm_msg,
+                )
                 continue
 
             trade, msg = backtest_open_trade_from_signal(
@@ -3407,10 +3141,31 @@ def run_day_backtest(tickers, date_value, modes, min_score, max_open, max_trades
                 open_trades.append(trade)
                 total_opened += 1
                 messages.append(msg)
+                log_event(
+                    current_time,
+                    "OPENED",
+                    ticker=trade.get("ticker", ""),
+                    mode=trade.get("mode", ""),
+                    side=trade.get("side", ""),
+                    score=trade.get("score", ""),
+                    price=fmt_price(trade.get("entry_price")),
+                    net=fmt_money(trade.get("net_pnl")),
+                    reason=trade.get("signal_reason", ""),
+                )
+            else:
+                log_event(
+                    current_time,
+                    "OPEN_BLOCKED",
+                    ticker=ticker,
+                    mode=mode,
+                    side=p.get("side", ""),
+                    score=p.get("score", ""),
+                    reason=msg,
+                )
 
         pending = new_pending
 
-        # Create new pending candidates if there is room
+        # 3) Scan for new candidates, just like the live scanner.
         if total_opened < int(max_trades_total) and len(open_trades) < int(max_open):
             for ticker, df in data.items():
                 if total_opened >= int(max_trades_total):
@@ -3430,24 +3185,34 @@ def run_day_backtest(tickers, date_value, modes, min_score, max_open, max_trades
 
                     sig = make_signal_from_history(ticker, mode, hist)
                     if sig.get("signal") not in ["LONG", "SHORT"]:
+                        # Not every WAIT is logged to avoid a huge unreadable file.
                         continue
                     if int(sig.get("score", 0)) < int(min_score):
                         continue
 
-                    pending.append(
-                        {
-                            "pending_id": str(uuid.uuid4()),
-                            "created_at": current_time,
-                            "ticker": ticker,
-                            "mode": mode,
-                            "side": sig["signal"],
-                            "score": int(sig["score"]),
-                            "status": "PENDING",
-                            "message": "מועמדת בבקטסט מחכה לאישור חוזר.",
-                        }
+                    p = {
+                        "pending_id": str(uuid.uuid4()),
+                        "created_at": current_time,
+                        "ticker": ticker,
+                        "mode": mode,
+                        "side": sig["signal"],
+                        "score": int(sig["score"]),
+                        "status": "PENDING",
+                        "message": "מועמדת בבקטסט מחכה לאישור חוזר.",
+                    }
+                    pending.append(p)
+                    log_event(
+                        current_time,
+                        "PENDING_CREATED",
+                        ticker=ticker,
+                        mode=mode,
+                        side=sig.get("signal", ""),
+                        score=sig.get("score", ""),
+                        price=fmt_price(sig.get("entry", np.nan)),
+                        reason=sig.get("reason", ""),
                     )
 
-        # Equity snapshot
+        # 4) Minute-by-minute equity and state snapshot.
         closed_net = sum(safe_float(t.get("net_pnl"), 0) for t in closed_trades)
         open_net = 0.0
         for trade in open_trades:
@@ -3467,26 +3232,56 @@ def run_day_backtest(tickers, date_value, modes, min_score, max_open, max_trades
                 "open_net": open_net,
                 "total_net": closed_net + open_net,
                 "open_trades": len(open_trades),
+                "pending": len(pending),
                 "closed_trades": len(closed_trades),
             }
         )
 
-    # Close remaining open trades at last available price
+        minute_state.append(
+            {
+                "time": str(current_time),
+                "open_trades": len(open_trades),
+                "pending": len(pending),
+                "closed_trades": len(closed_trades),
+                "closed_net": closed_net,
+                "open_net": open_net,
+                "total_net": closed_net + open_net,
+                "open_list": format_open_list(),
+                "pending_list": format_pending_list(),
+            }
+        )
+
+    # 5) End of day: close remaining open trades at their last available price.
     for trade in open_trades:
         ticker = trade["ticker"]
         df = data.get(ticker, pd.DataFrame())
         if df.empty:
             continue
         last_bar = df.iloc[-1]
-        closed_trades.append(backtest_close_trade(trade, safe_float(last_bar["close"]), df.index[-1], "END_OF_DAY"))
+        closed = backtest_close_trade(trade, safe_float(last_bar["close"]), df.index[-1], "END_OF_DAY")
+        closed_trades.append(closed)
+        log_event(
+            df.index[-1],
+            "CLOSED_END_OF_DAY",
+            ticker=closed.get("ticker", ""),
+            mode=closed.get("mode", ""),
+            side=closed.get("side", ""),
+            score=closed.get("score", ""),
+            price=fmt_price(closed.get("exit_price")),
+            net=fmt_money(closed.get("net_pnl")),
+            reason=closed.get("exit_reason_he", "") or closed.get("exit_reason", ""),
+        )
 
     trades_df = pd.DataFrame(closed_trades)
     if not trades_df.empty:
         for col in TRADE_COLUMNS:
             if col not in trades_df.columns:
                 trades_df[col] = np.nan
+        trades_df = trades_df[TRADE_COLUMNS]
 
     equity_df = pd.DataFrame(equity_points)
+    event_df = pd.DataFrame(event_log)
+    state_df = pd.DataFrame(minute_state)
 
     if trades_df.empty:
         summary = {
@@ -3516,6 +3311,8 @@ def run_day_backtest(tickers, date_value, modes, min_score, max_open, max_trades
         "equity": equity_df,
         "messages": messages,
         "missing": missing,
+        "event_log": event_df,
+        "minute_state": state_df,
     }
 
 
@@ -3562,20 +3359,18 @@ def render_backtest_trades_table(trades_df):
 # Main UI
 # ============================================================
 
-# One-time lightweight migration: rewrite old trades CSV with safe dtypes if it exists,
-# and rewrite tickers so the avoid-list tickers disappear from older saved settings.
+# One-time lightweight migration: rewrite old trades CSV with safe dtypes if it exists.
 try:
     if TRADES_FILE.exists() and TRADES_FILE.stat().st_size > 0:
         _tmp_trades = load_trades()
         save_trades(_tmp_trades)
-    save_tickers(load_tickers())
 except Exception:
     pass
 
 st.markdown(
     """
 <div class="title-box">
-<h1>🧪 Paper Trading Lab V6.5</h1>
+<h1>🧪 Paper Trading Lab V6.4 REALTIME REPLAY</h1>
 <p>אפליקציית Paper Trading נקייה: יעד מחזור 50$, סטופ ידני, סיבות יציאה, Break-even אחרי עלויות וצמצום הפסדים.</p>
 </div>
 """,
@@ -3590,15 +3385,13 @@ tab_paper, tab_ticket, tab_costs, tab_units, tab_rules, tab_account, tab_alerts,
     "⚙️ חוקים חכמים",
     "🏦 חשבון ומחזורים",
     "🔔 Alerts",
-    "📊 Backtest יום מסחר",
+    "📊 Real-Time Replay",
     "📘 הסבר",
 ])
 
 
 with tab_paper:
     st.markdown("<div class='card warn'><strong>בדמו בלבד:</strong> אין חיבור לברוקר ואין כסף אמיתי.</div>", unsafe_allow_html=True)
-    st.caption("Avoid list פעילה: " + ", ".join(BLOCKED_TICKERS))
-    st.caption("V6.5: כניסות חסומות ב־15 הדקות הראשונות, LONG חייב לנצח SHORT בפער ברור, ומצב חצי שעה הוא ברירת המחדל.")
 
     trades, update_msgs = update_open_trades()
     pending_msgs = process_pending_signals(min_score=4)
@@ -3620,16 +3413,13 @@ with tab_paper:
         if st.button("➕ הוסף מניה", use_container_width=True):
             t = normalize_ticker(new_ticker)
             if t:
-                if is_blocked_ticker(t):
-                    st.warning(f"{t} חסומה לפי רשימת Avoid ולא תתווסף.")
-                else:
-                    tickers.append(t)
-                    save_tickers(tickers)
-                    st.success(f"{t} נוסף.")
-                    st.rerun()
+                tickers.append(t)
+                save_tickers(tickers)
+                st.success(f"{t} נוסף.")
+                st.rerun()
 
     with b:
-        modes = st.multiselect("סוג השקעה", ["חצי שעה", "מהירה"], default=["חצי שעה"])
+        modes = st.multiselect("סוג השקעה", ["מהירה", "חצי שעה"], default=["מהירה", "חצי שעה"])
         min_score = st.slider("מינימום ניקוד לפתיחה", 1, 8, 8)
         max_new_now = st.number_input("כמה עסקאות חדשות לפתוח בסריקה", 1, 20, 2, key="paper_max_new_trades_now")
         max_open_now = st.number_input("מקסימום עסקאות פתוחות במקביל", 1, 30, 4, key="paper_max_open_trades_now")
@@ -4014,13 +3804,25 @@ with tab_alerts:
 
 
 
+
 with tab_backtest:
-    st.subheader("📊 Backtest יום מסחר")
+    st.subheader("📊 Real-Time Replay Backtest")
 
     st.markdown(
         """
 <div class="card warn">
-<strong>בדמו בלבד:</strong> הבקטסט הוא סימולציה היסטורית. הוא לא מבטיח תוצאה עתידית ולא משתמש בכסף אמיתי.
+<strong>בדמו בלבד:</strong> זה Replay היסטורי דקה־דקה. הוא מדמה את Paper Trading בזמן אמת, אבל לא מבטיח תוצאה עתידית ולא משתמש בכסף אמיתי.
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        """
+<div class="card">
+<strong>מה שונה פה מבקטסט רגיל?</strong><br>
+הסימולציה לא מסתכלת קדימה. בכל דקה היא רואה רק את הנרות שהיו קיימים עד אותה דקה,
+מייצרת מועמדות, מחכה את זמן האישור, בודקת מחדש, פותחת Paper Trade, מנהלת עסקאות פתוחות וסוגרת לפי אותם כללי ניהול.
 </div>
 """,
         unsafe_allow_html=True,
@@ -4046,8 +3848,8 @@ with tab_backtest:
     with bt2:
         bt_modes = st.multiselect(
             "סוג השקעה",
-            ["חצי שעה", "מהירה"],
-            default=["חצי שעה"],
+            ["מהירה", "חצי שעה"],
+            default=["מהירה", "חצי שעה"],
             key="bt_modes",
         )
 
@@ -4076,9 +3878,9 @@ with tab_backtest:
             key="bt_max_total",
         )
 
-        run_bt = st.button("▶️ הרץ Backtest", use_container_width=True, key="run_backtest")
+        run_bt = st.button("▶️ הרץ Real-Time Replay", use_container_width=True, key="run_realtime_replay")
 
-    st.caption("הבקטסט עובר נר־נר לפי נתוני 1 דקה. עם yfinance הכי אמין לבחור יום מהימים האחרונים.")
+    st.caption("ה־Replay עובר דקה־דקה. עם yfinance הכי אמין לבחור יום מהימים האחרונים.")
 
     if run_bt:
         if not bt_tickers:
@@ -4086,8 +3888,8 @@ with tab_backtest:
         elif not bt_modes:
             st.warning("בחר לפחות סוג השקעה אחד.")
         else:
-            with st.spinner("מריץ Backtest דקה־דקה..."):
-                result = run_day_backtest(
+            with st.spinner("מריץ Replay דקה־דקה כמו Paper Trading בזמן אמת..."):
+                st.session_state["last_replay_result"] = run_day_backtest(
                     tickers=bt_tickers,
                     date_value=bt_date,
                     modes=bt_modes,
@@ -4095,27 +3897,40 @@ with tab_backtest:
                     max_open=bt_max_open,
                     max_trades_total=bt_max_total,
                 )
+                st.session_state["last_replay_meta"] = {
+                    "tickers": bt_tickers,
+                    "date": str(bt_date),
+                    "modes": bt_modes,
+                    "min_score": bt_min_score,
+                }
 
-            summary = result["summary"]
-            trades_df = result["trades"]
-            equity_df = result["equity"]
-            missing = result["missing"]
+    result = st.session_state.get("last_replay_result")
+    if result:
+        summary = result.get("summary", {})
+        trades_df = result.get("trades", pd.DataFrame())
+        equity_df = result.get("equity", pd.DataFrame())
+        event_df = result.get("event_log", pd.DataFrame())
+        state_df = result.get("minute_state", pd.DataFrame())
+        missing = result.get("missing", [])
 
-            if missing:
-                st.warning("לא נמצאו נתונים לתאריך הזה עבור: " + ", ".join(missing[:20]))
+        if missing:
+            st.warning("לא נמצאו נתונים לתאריך הזה עבור: " + ", ".join(missing[:20]))
 
-            if summary:
-                s1, s2, s3, s4 = st.columns(4)
-                s1.metric("רווח נטו בבקטסט", fmt_money(summary.get("net", 0)))
-                s2.metric("רווח ברוטו", fmt_money(summary.get("gross", 0)))
-                s3.metric("סך עלויות", fmt_money(summary.get("costs", 0)))
-                s4.metric("אחוז הצלחה", f"{summary.get('win_rate', 0):.1f}%")
+        if summary:
+            s1, s2, s3, s4 = st.columns(4)
+            s1.metric("רווח נטו ב־Replay", fmt_money(summary.get("net", 0)))
+            s2.metric("רווח ברוטו", fmt_money(summary.get("gross", 0)))
+            s3.metric("סך עלויות", fmt_money(summary.get("costs", 0)))
+            s4.metric("אחוז הצלחה", f"{summary.get('win_rate', 0):.1f}%")
 
-                s5, s6, s7 = st.columns(3)
-                s5.metric("כמות עסקאות", summary.get("trades", 0))
-                s6.metric("עסקאות מרוויחות", summary.get("wins", 0))
-                s7.metric("עסקאות מפסידות", summary.get("losses", 0))
+            s5, s6, s7 = st.columns(3)
+            s5.metric("כמות עסקאות", summary.get("trades", 0))
+            s6.metric("עסקאות מרוויחות", summary.get("wins", 0))
+            s7.metric("עסקאות מפסידות", summary.get("losses", 0))
 
+        inner_tabs = st.tabs(["📈 Equity", "🕐 Minute Replay", "📋 Event Log", "עסקאות", "ניתוח"])
+
+        with inner_tabs[0]:
             if not equity_df.empty:
                 fig = go.Figure()
                 fig.add_trace(
@@ -4126,16 +3941,79 @@ with tab_backtest:
                         name="Equity נטו",
                     )
                 )
+                fig.add_trace(
+                    go.Scatter(
+                        x=equity_df["time"],
+                        y=equity_df["open_net"],
+                        mode="lines",
+                        name="Open P/L",
+                    )
+                )
+                fig.add_trace(
+                    go.Scatter(
+                        x=equity_df["time"],
+                        y=equity_df["closed_net"],
+                        mode="lines",
+                        name="Closed P/L",
+                    )
+                )
                 fig.update_layout(
-                    title="גרף רווח נטו במהלך היום",
+                    title="רווח נטו במהלך היום — דקה אחרי דקה",
                     height=420,
                     margin=dict(l=10, r=10, t=50, b=10),
                 )
                 st.plotly_chart(fig, use_container_width=True)
 
-            st.markdown("### עסקאות Backtest")
+                st.dataframe(equity_df.tail(80), use_container_width=True, hide_index=True)
+            else:
+                st.info("אין נתוני Equity.")
+
+        with inner_tabs[1]:
+            if state_df.empty:
+                st.info("אין Snapshot דקה־דקה.")
+            else:
+                idx = st.slider(
+                    "בחר דקה בריפליי",
+                    0,
+                    max(0, len(state_df) - 1),
+                    max(0, len(state_df) - 1),
+                    key="replay_minute_slider",
+                )
+                row = state_df.iloc[int(idx)]
+
+                a, b, c, d = st.columns(4)
+                a.metric("זמן", str(row["time"])[11:19])
+                b.metric("עסקאות פתוחות", int(row["open_trades"]))
+                c.metric("מועמדות בהמתנה", int(row["pending"]))
+                d.metric("רווח נטו באותו רגע", fmt_money(row["total_net"]))
+
+                st.markdown("#### עסקאות פתוחות באותה דקה")
+                if str(row.get("open_list", "")).strip():
+                    st.code(str(row["open_list"]), language="text")
+                else:
+                    st.info("אין עסקאות פתוחות בדקה הזאת.")
+
+                st.markdown("#### מועמדות שמחכות לאישור")
+                if str(row.get("pending_list", "")).strip():
+                    st.code(str(row["pending_list"]), language="text")
+                else:
+                    st.info("אין מועמדות בהמתנה בדקה הזאת.")
+
+                st.markdown("#### כל ה־Snapshots")
+                st.dataframe(state_df, use_container_width=True, hide_index=True)
+
+        with inner_tabs[2]:
+            if event_df.empty:
+                st.info("אין Event Log.")
+            else:
+                st.markdown("כאן רואים ממש מה קרה בדקה־דקה: מועמדת נוצרה, נדחתה, אושרה, עסקה נפתחה, עסקה נסגרה.")
+                st.dataframe(event_df, use_container_width=True, hide_index=True)
+
+        with inner_tabs[3]:
+            st.markdown("### עסקאות Replay")
             render_backtest_trades_table(trades_df)
 
+        with inner_tabs[4]:
             if not trades_df.empty:
                 st.markdown("### ניתוח לפי מניה")
                 by_ticker = (
@@ -4150,6 +4028,20 @@ with tab_backtest:
                     .sort_values("רווח_נטו", ascending=False)
                 )
                 st.dataframe(by_ticker, use_container_width=True, hide_index=True)
+
+                st.markdown("### ניתוח לפי מצב")
+                by_mode = (
+                    trades_df.assign(net_pnl_num=pd.to_numeric(trades_df["net_pnl"], errors="coerce").fillna(0))
+                    .groupby("mode")
+                    .agg(
+                        עסקאות=("trade_id", "count"),
+                        רווח_נטו=("net_pnl_num", "sum"),
+                        ממוצע=("net_pnl_num", "mean"),
+                    )
+                    .reset_index()
+                    .sort_values("רווח_נטו", ascending=False)
+                )
+                st.dataframe(by_mode, use_container_width=True, hide_index=True)
 
                 st.markdown("### ניתוח לפי סיבת יציאה")
                 reason_df = trades_df.copy()
@@ -4166,11 +4058,8 @@ with tab_backtest:
                     .sort_values("רווח_נטו", ascending=False)
                 )
                 st.dataframe(by_reason, use_container_width=True, hide_index=True)
-
-            if result["messages"]:
-                with st.expander("לוג פתיחות בבקטסט"):
-                    for msg in result["messages"][:120]:
-                        st.write(msg)
+            else:
+                st.info("לא נפתחו עסקאות.")
 
 
 with tab_help:
@@ -4205,7 +4094,7 @@ with tab_help:
 - ווליום
 - מבנה נרות
 
-### What changed in V6.5?
+### What changed in V6.4 REALTIME REPLAY?
 
 **זמן יציאה ומשך עסקה**  
 בכל עסקה סגורה מופיע זמן יציאה וגם משך העסקה בדקות.

@@ -1,3 +1,3 @@
-# Paper Trading Lab V6.5
+# Paper Trading Lab V6.4 REALTIME REPLAY
 
-Adds strict LONG filter, QQQ market alignment for LONG, required side-score gap, no-entry first 15 minutes, and half-hour mode as default. Paper trading only.
+Based on V6.3 RESTORE. Adds a real-time-like historical replay backtest: minute-by-minute simulation with pending candidates, delayed confirmation, open trades, exits, event log, and minute state snapshots. Paper trading only.
