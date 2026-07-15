@@ -22,7 +22,7 @@ import plotly.graph_objects as go
 # App setup
 # ============================================================
 
-st.set_page_config(page_title="Paper Trading Lab V6.4", page_icon="🧪", layout="wide")
+st.set_page_config(page_title="Paper Trading Lab V6.5", page_icon="🧪", layout="wide")
 
 DATA_DIR = Path("paper_data")
 DATA_DIR.mkdir(exist_ok=True)
@@ -89,6 +89,11 @@ DEFAULT_RULES = {
     "min_net_profit_for_giveback": 5.0,
     "confirm_before_entry_seconds": 60,
     "pending_signal_expire_minutes": 6,
+
+    # Direction-quality filters
+    "no_entry_first_minutes": 15,
+    "required_side_score_gap": 2,
+
     "use_history_after_minutes": 30,
     "history_min_samples": 2,
     "history_max_score_bonus": 2,
@@ -1440,6 +1445,124 @@ def market_allows_short_live(mode):
         return False, f"Short blocked: market filter error {str(e)[:80]}"
 
 
+def market_allows_long_live(mode):
+    """
+    Conservative live-only market filter for longs.
+    If QQQ is bearish or under VWAP/EMA structure, a LONG is blocked.
+    """
+    try:
+        q = latest_session(fetch_1m("QQQ"))
+        if q is None or q.empty:
+            return False, "Long blocked: QQQ data unavailable."
+
+        q = add_indicators(q).dropna(subset=["close"])
+        if q.empty:
+            return False, "Long blocked: QQQ indicators unavailable."
+
+        last = q.iloc[-1]
+        close = safe_float(last["close"])
+
+        if str(mode) == "מהירה":
+            ok = (
+                close > safe_float(last["vwap"])
+                and close > safe_float(last["ema9"])
+                and safe_float(last["ema3"]) > safe_float(last["ema5"])
+                and safe_float(last["ema3_slope"], 0) > 0
+                and safe_float(last["ema5_slope"], 0) > 0
+            )
+        else:
+            ok = (
+                close > safe_float(last["vwap"])
+                and close > safe_float(last["ema50"])
+                and safe_float(last["ema9"]) > safe_float(last["ema21"])
+                and safe_float(last["ema9_slope"], 0) > 0
+                and safe_float(last["ema21_slope"], 0) > 0
+            )
+
+        if ok:
+            return True, "Market filter: QQQ also bullish."
+        return False, "Long blocked: QQQ is not bullish enough."
+    except Exception as e:
+        return False, f"Long blocked: market filter error {str(e)[:80]}"
+
+
+def entry_time_gate(current_time):
+    """
+    Blocks new entries during the first minutes after the NY open.
+    This prevents fake early LONG/SHORT signals from the opening noise.
+    """
+    rules = load_rules()
+    block_minutes = float(rules.get("no_entry_first_minutes", 15))
+    elapsed = session_minutes_from_open(current_time)
+    if elapsed < block_minutes:
+        return False, f"Entry blocked: only {elapsed:.0f} minutes from open. Required {block_minutes:.0f}."
+    return True, f"Entry time gate passed: {elapsed:.0f} minutes from open."
+
+
+def choose_direction_with_gap(ls, ss):
+    """
+    Do not choose LONG just because it tied SHORT.
+    The chosen side must beat the opposite side by a clear gap.
+    """
+    rules = load_rules()
+    gap = int(rules.get("required_side_score_gap", 2))
+
+    if int(ls) >= 3 and int(ls) >= int(ss) + gap:
+        return "LONG", int(ls), f"Direction OK: LONG score {int(ls)} vs SHORT score {int(ss)}, gap {gap}."
+    if int(ss) >= 3 and int(ss) >= int(ls) + gap:
+        return "SHORT", int(ss), f"Direction OK: SHORT score {int(ss)} vs LONG score {int(ls)}, gap {gap}."
+
+    return "WAIT", max(int(ls), int(ss)), f"Direction blocked: LONG {int(ls)} vs SHORT {int(ss)} — no clear gap."
+
+
+def strict_long_quality_filter(d, mode, score, use_market_filter=True):
+    """
+    Prevent false LONG entries that are actually bearish setups.
+    LONG requires:
+    - final score 8
+    - clean bullish structure on the ticker
+    - in live scans, QQQ must also be bullish
+    """
+    if d is None or d.empty:
+        return False, "Long blocked: no data."
+
+    last = d.iloc[-1]
+    close = safe_float(last["close"])
+
+    if int(score) < 8:
+        return False, f"Long blocked: score {int(score)} is below required 8."
+
+    if str(mode) == "מהירה":
+        ticker_ok = (
+            close > safe_float(last["vwap"])
+            and close > safe_float(last["ema9"])
+            and safe_float(last["ema3"]) > safe_float(last["ema5"])
+            and safe_float(last["ema3_slope"], 0) > 0
+            and safe_float(last["ema5_slope"], 0) > 0
+            and safe_float(last["mom2_pct"], 0) > 0.03
+        )
+    else:
+        ticker_ok = (
+            close > safe_float(last["vwap"])
+            and close > safe_float(last["ema50"])
+            and safe_float(last["ema9"]) > safe_float(last["ema21"])
+            and safe_float(last["ema9_slope"], 0) > 0
+            and safe_float(last["ema21_slope"], 0) > 0
+            and safe_float(last["mom30_pct"], 0) > 0.05
+        )
+
+    if not ticker_ok:
+        return False, "Long blocked: ticker bullish structure is not strong enough."
+
+    if use_market_filter:
+        market_ok, market_msg = market_allows_long_live(mode)
+        if not market_ok:
+            return False, market_msg
+        return True, "Strict long filter passed. " + market_msg
+
+    return True, "Strict long filter passed."
+
+
 def strict_short_quality_filter(d, mode, score, use_market_filter=True):
     """
     Based on the latest paper report, shorts were the weak side.
@@ -1625,12 +1748,17 @@ def make_signal(ticker, mode):
     entry = safe_float(d.iloc[-1]["close"])
     atr = max(atr, entry * 0.0008)
 
-    if ls >= ss and ls >= 3:
-        side, score, reasons = "LONG", ls, lr
-    elif ss > ls and ss >= 3:
-        side, score, reasons = "SHORT", ss, sr
+    gate_ok, gate_msg = entry_time_gate(d.index[-1])
+    if not gate_ok:
+        return {"signal": "WAIT", "ticker": ticker, "mode": mode, "score": max(ls, ss), "reason": gate_msg}
+
+    side, score, gap_msg = choose_direction_with_gap(ls, ss)
+    if side == "LONG":
+        reasons = lr + [gap_msg]
+    elif side == "SHORT":
+        reasons = sr + [gap_msg]
     else:
-        return {"signal": "WAIT", "ticker": ticker, "mode": mode, "score": max(ls, ss), "reason": f"לונג {ls}, שורט {ss} — אין יתרון ברור"}
+        return {"signal": "WAIT", "ticker": ticker, "mode": mode, "score": score, "reason": gap_msg}
 
     chart_plan = chart_based_stop_target(d, side, mode)
     stop = chart_plan["stop"]
@@ -1650,6 +1778,18 @@ def make_signal(ticker, mode):
         }
 
     extra_reasons = [chart_plan["reason"], hist_adj.get("reason", ""), time_msg]
+
+    if side == "LONG":
+        long_ok, long_msg = strict_long_quality_filter(d, mode, score, use_market_filter=True)
+        if not long_ok:
+            return {
+                "signal": "WAIT",
+                "ticker": normalize_ticker(ticker),
+                "mode": mode,
+                "score": int(score),
+                "reason": long_msg,
+            }
+        extra_reasons.append(long_msg)
 
     if side == "SHORT":
         short_ok, short_msg = strict_short_quality_filter(d, mode, score, use_market_filter=True)
@@ -2760,17 +2900,28 @@ def make_signal_from_history(ticker, mode, hist_df):
 
     entry = safe_float(d.iloc[-1]["close"])
 
-    if ls >= ss and ls >= 3:
-        side, score, reasons = "LONG", ls, lr
-    elif ss > ls and ss >= 3:
-        side, score, reasons = "SHORT", ss, sr
-    else:
+    gate_ok, gate_msg = entry_time_gate(d.index[-1])
+    if not gate_ok:
         return {
             "signal": "WAIT",
             "ticker": normalize_ticker(ticker),
             "mode": mode,
             "score": max(ls, ss),
-            "reason": f"לונג {ls}, שורט {ss} — אין יתרון ברור",
+            "reason": gate_msg,
+        }
+
+    side, score, gap_msg = choose_direction_with_gap(ls, ss)
+    if side == "LONG":
+        reasons = lr + [gap_msg]
+    elif side == "SHORT":
+        reasons = sr + [gap_msg]
+    else:
+        return {
+            "signal": "WAIT",
+            "ticker": normalize_ticker(ticker),
+            "mode": mode,
+            "score": score,
+            "reason": gap_msg,
         }
 
     chart_plan = chart_based_stop_target(d, side, mode)
@@ -2791,6 +2942,18 @@ def make_signal_from_history(ticker, mode, hist_df):
         }
 
     extra_reasons = [chart_plan.get("reason", ""), hist_adj.get("reason", ""), time_msg]
+
+    if side == "LONG":
+        long_ok, long_msg = strict_long_quality_filter(d, mode, score, use_market_filter=False)
+        if not long_ok:
+            return {
+                "signal": "WAIT",
+                "ticker": normalize_ticker(ticker),
+                "mode": mode,
+                "score": int(score),
+                "reason": long_msg,
+            }
+        extra_reasons.append(long_msg)
 
     if side == "SHORT":
         short_ok, short_msg = strict_short_quality_filter(d, mode, score, use_market_filter=False)
@@ -3412,7 +3575,7 @@ except Exception:
 st.markdown(
     """
 <div class="title-box">
-<h1>🧪 Paper Trading Lab V6.4</h1>
+<h1>🧪 Paper Trading Lab V6.5</h1>
 <p>אפליקציית Paper Trading נקייה: יעד מחזור 50$, סטופ ידני, סיבות יציאה, Break-even אחרי עלויות וצמצום הפסדים.</p>
 </div>
 """,
@@ -3435,6 +3598,7 @@ tab_paper, tab_ticket, tab_costs, tab_units, tab_rules, tab_account, tab_alerts,
 with tab_paper:
     st.markdown("<div class='card warn'><strong>בדמו בלבד:</strong> אין חיבור לברוקר ואין כסף אמיתי.</div>", unsafe_allow_html=True)
     st.caption("Avoid list פעילה: " + ", ".join(BLOCKED_TICKERS))
+    st.caption("V6.5: כניסות חסומות ב־15 הדקות הראשונות, LONG חייב לנצח SHORT בפער ברור, ומצב חצי שעה הוא ברירת המחדל.")
 
     trades, update_msgs = update_open_trades()
     pending_msgs = process_pending_signals(min_score=4)
@@ -3465,7 +3629,7 @@ with tab_paper:
                     st.rerun()
 
     with b:
-        modes = st.multiselect("סוג השקעה", ["מהירה", "חצי שעה"], default=["מהירה", "חצי שעה"])
+        modes = st.multiselect("סוג השקעה", ["חצי שעה", "מהירה"], default=["חצי שעה"])
         min_score = st.slider("מינימום ניקוד לפתיחה", 1, 8, 8)
         max_new_now = st.number_input("כמה עסקאות חדשות לפתוח בסריקה", 1, 20, 2, key="paper_max_new_trades_now")
         max_open_now = st.number_input("מקסימום עסקאות פתוחות במקביל", 1, 30, 4, key="paper_max_open_trades_now")
@@ -3882,8 +4046,8 @@ with tab_backtest:
     with bt2:
         bt_modes = st.multiselect(
             "סוג השקעה",
-            ["מהירה", "חצי שעה"],
-            default=["מהירה", "חצי שעה"],
+            ["חצי שעה", "מהירה"],
+            default=["חצי שעה"],
             key="bt_modes",
         )
 
@@ -4041,7 +4205,7 @@ with tab_help:
 - ווליום
 - מבנה נרות
 
-### What changed in V6.4?
+### What changed in V6.5?
 
 **זמן יציאה ומשך עסקה**  
 בכל עסקה סגורה מופיע זמן יציאה וגם משך העסקה בדקות.

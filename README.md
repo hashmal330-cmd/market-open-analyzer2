@@ -1,3 +1,3 @@
-# Paper Trading Lab V6.4
+# Paper Trading Lab V6.5
 
-Adds avoid-list filtering for ADBE, MSFT, BABA, COIN, SMCI, UBER, and LLY. Adds stricter SHORT filtering and after-30-minute quality filter. Paper trading only.
+Adds strict LONG filter, QQQ market alignment for LONG, required side-score gap, no-entry first 15 minutes, and half-hour mode as default. Paper trading only.
