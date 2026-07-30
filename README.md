@@ -1,3 +1,7 @@
-# Paper Trading Lab V6.4 REALTIME REPLAY
+# Engineering Pattern Live Monitor V2.1 — Unique Button Keys
 
-Based on V6.3 RESTORE. Adds a real-time-like historical replay backtest: minute-by-minute simulation with pending candidates, delayed confirmation, open trades, exits, event log, and minute state snapshots. Paper trading only.
+Fixes StreamlitDuplicateElementKey by adding unique key prefixes for buttons rendered in different tabs:
+- live_* for the real-time prediction tab
+- telegram_* for the Telegram tab
+
+Keeps V2.0 features: inline green entry buttons, tracked trades table, red exit buttons, Telegram entry/exit messages, and live paper P/L tracking.
